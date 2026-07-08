@@ -38,7 +38,7 @@ with the Lance prerelease and NVIDIA package indexes enabled:
 pip install \
   --extra-index-url https://pypi.fury.io/lance-format/ \
   --extra-index-url https://pypi.nvidia.com/ \
-  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@28b79dbf80b591c1f3ab40fd1091fdd3eec9fb78"
+  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@e60c6cae9279d440d142426b8625c07b64fe2f0d"
 ```
 
 ### Simple Example
