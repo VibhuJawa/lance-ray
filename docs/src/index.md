@@ -30,15 +30,15 @@ To install a prerelease version:
 pip install lance-ray==0.2.0b1 --extra-index-url https://pypi.fury.io/lance-format/
 ```
 
-The GPU column-fetch API is versioned as `0.5.0`. Until that release is
-published, install it from the companion branch with the Lance and NVIDIA
-package indexes enabled:
+The GPU column-fetch API requires Python 3.11 or newer and is versioned as
+`0.5.0`. Until that release is published, install the exact companion commit
+with the Lance prerelease and NVIDIA package indexes enabled:
 
 ```shell
 pip install \
   --extra-index-url https://pypi.fury.io/lance-format/ \
   --extra-index-url https://pypi.nvidia.com/ \
-  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@agent/gpu-column-fetch"
+  "lance-ray[gpu] @ git+https://github.com/VibhuJawa/lance-ray.git@28b79dbf80b591c1f3ab40fd1091fdd3eec9fb78"
 ```
 
 ### Simple Example

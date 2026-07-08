@@ -39,6 +39,9 @@ sidecars containing `(key, stable_row_id)`, then fetches selected columns from a
 pinned Lance version. Each Ray GPU actor loads the cuDF index once; payloads
 remain in Arrow host memory and are never shuffled through the GPU.
 
+This API requires Python 3.11 or newer on Linux x86_64 and the optional GPU
+dependencies installed with `lance-ray[gpu]`.
+
 ```python
 import lance_ray as lr
 
@@ -46,7 +49,7 @@ config = lr.GpuLanceFetchConfig(
     dataset_uri="s3://bucket/images.lance",
     dataset_version=4,
     sidecar_files=("s3://bucket/index/part-000.parquet",),
-    sidecar_manifest_uri="s3://bucket/index/sidecar-manifest-v1.json",
+    sidecar_manifest_uri="s3://bucket/index/sidecar-manifest-v2.json",
     sidecar_manifest_sha256="<caller-pinned lowercase SHA-256>",
     columns={"image": "image"},
     expected_reference_rows=355_952_746,
@@ -78,11 +81,12 @@ control the sparse-read chunk size, concurrency, and bounded submission queue.
 The fetcher requires a pinned append-only Lance snapshot whose stable row IDs
 span the global manifest-order ordinal range: fragment IDs are contiguous,
 physical row counts agree, and deletions are rejected during actor setup.
-It also requires the v1 canonical sidecar manifest produced by NeMo Curator's
+It also requires the v2 canonical sidecar manifest produced by NeMo Curator's
 `build_gpu_lance_sidecar_manifest` module. The caller-pinned manifest digest
 binds the Lance URI, version, fragment-row fingerprint, exact row-ID range,
 and every Parquet path, partition, ordinal, row count, byte size, and SHA-256.
-Legacy sidecars without this contract are rejected before the GPU index or
+The v2 contract also pins a SHA-256 over the full key-to-stable-ordinal stream.
+Legacy v1 manifests are rejected and must be rebuilt before the GPU index or
 payload reader is initialized.
 
 Only keys and fixed-width stable IDs enter the GPU lookup. Private Lance reads

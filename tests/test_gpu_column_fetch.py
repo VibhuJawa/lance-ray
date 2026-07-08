@@ -114,6 +114,7 @@ def _write_contract(tmp_path: Path, dataset, mapping: dict[str, int]):
         "format": gpu_mod._SIDECAR_CONTRACT_FORMAT,
         "fragment_manifest_sha256": fragment_digest,
         "key_column": "url",
+        "key_stable_ordinal_sha256": "a" * 64,
         "layout": "replicated_sorted",
         "partition_count": 1,
         "row_id_column": "stable_row_id",
@@ -147,6 +148,13 @@ def _config(dataset, **overrides) -> GpuLanceFetchConfig:
     }
     kwargs.update(overrides)
     return GpuLanceFetchConfig(**kwargs)
+
+
+def test_gpu_extra_rejects_python_310(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gpu_mod.sys, "version_info", (3, 10, 14))
+
+    with pytest.raises(RuntimeError, match=r"Python >=3\.11"):
+        gpu_mod._GpuExactKeyIndex((), "key", "stable_row_id", {}, 0, 0.7)
 
 
 @pytest.fixture

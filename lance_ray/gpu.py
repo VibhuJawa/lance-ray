@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import time
 from bisect import bisect_right
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 
 
 _METRICS_METADATA_KEY = b"lance-ray:gpu-column-fetch-metrics"
-_SIDECAR_CONTRACT_FORMAT = "nemo-curator-gpu-lance-sidecar-v1"
+_SIDECAR_CONTRACT_FORMAT = "nemo-curator-gpu-lance-sidecar-v2"
 _STABLE_ID_COVERAGE_DTYPE = "uint32"
 PayloadReadMode = Literal["sparse", "adaptive_unmeasured"]
 PrivateReadStrategy = Literal["take_rows", "take_scan_ranges", "take_scan_fragment"]
@@ -105,6 +106,7 @@ def _validate_sidecar_contract(
         "format",
         "fragment_manifest_sha256",
         "key_column",
+        "key_stable_ordinal_sha256",
         "layout",
         "partition_count",
         "row_id_column",
@@ -113,7 +115,11 @@ def _validate_sidecar_contract(
         "total_rows",
     }
     if set(payload) != required:
-        raise ValueError("sidecar manifest keys differ from the v1 contract")
+        raise ValueError("sidecar manifest keys differ from the v2 contract")
+    key_identity = payload["key_stable_ordinal_sha256"]
+    if not isinstance(key_identity, str):
+        raise TypeError("sidecar key-to-stable-ordinal SHA-256 must be a string")
+    _require_sha256(key_identity, "sidecar key-to-stable-ordinal SHA-256")
     expected = {
         "dataset_uri": config.dataset_uri,
         "dataset_version": config.dataset_version,
@@ -338,6 +344,11 @@ class _GpuExactKeyIndex:
         expected_rows: int,
         load_factor: float,
     ) -> None:
+        if sys.version_info < (3, 11):
+            raise RuntimeError(
+                "GPU column fetch requires Python >=3.11; the 'gpu' extra is "
+                "not supported on Python 3.10."
+            )
         try:
             import cudf
             import cupy as cp
@@ -346,8 +357,9 @@ class _GpuExactKeyIndex:
             from pylibcudf.types import NullEquality, NullOrder, Order
         except ImportError as exc:  # pragma: no cover - GPU environment only
             raise ImportError(
-                "GPU column fetch requires the 'gpu' extra and a compatible CUDA "
-                "driver (for example: pip install 'lance-ray[gpu]')."
+                "GPU column fetch requires Python >=3.11, the 'gpu' extra, and a "
+                "compatible CUDA driver on Linux x86_64 (for example: pip install "
+                "'lance-ray[gpu]')."
             ) from exc
 
         self._cp = cp
