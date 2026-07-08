@@ -72,8 +72,9 @@ images = lr.fetch_lance_columns_on_gpu(
 The byte target is converted to Ray's row-based `batch_size`, so it is an
 estimate for object-store coalescing. `max_lookup_bytes` independently provides
 a hard cap on each Arrow-to-GPU lookup window. Per-batch sparse-call, I/O, and
-timing measurements are available through `get_gpu_fetch_metrics` when Arrow
-schema metadata is preserved by the downstream operation.
+timing measurements, including physical read operations/s and average read
+size, are available through `get_gpu_fetch_metrics` when Arrow schema metadata
+is preserved by the downstream operation.
 
 Mapped stable IDs are deduplicated and sorted before private `_take_rows`
 calls. `fetch_batch_size`, `io_threads`, and `max_pending_fetch_batches`

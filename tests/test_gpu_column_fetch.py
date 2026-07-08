@@ -271,6 +271,9 @@ def test_fetch_preserves_arrow_order_and_reports_sparse_io(
     assert metrics["payload_bytes"] == 57
     assert metrics["lance_read_iops"] >= 0
     assert metrics["lance_read_bytes"] >= metrics["payload_bytes"]
+    assert metrics["physical_read_operations_per_second"] == pytest.approx(
+        metrics["lance_read_iops"] / metrics["payload_fetch_seconds"]
+    )
     assert metrics["average_physical_read_bytes"] >= 0
     assert metrics["physical_reads_per_unique_payload"] >= 0
     assert metrics["index_loaded_this_batch"] is True

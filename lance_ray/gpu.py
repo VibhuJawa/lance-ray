@@ -1208,6 +1208,9 @@ class GpuLanceColumnFetcher:
             "stage_windows": 1,
             "lance_read_iops": int(io_stats.read_iops),
             "lance_read_bytes": int(io_stats.read_bytes),
+            "physical_read_operations_per_second": (
+                float(io_stats.read_iops) / fetch_seconds if fetch_seconds else 0.0
+            ),
             "average_physical_read_bytes": (
                 float(io_stats.read_bytes) / io_stats.read_iops
                 if io_stats.read_iops
