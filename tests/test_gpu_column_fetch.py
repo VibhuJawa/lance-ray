@@ -295,13 +295,14 @@ def test_lookup_windows_have_a_hard_arrow_byte_bound(tmp_path: Path, fake_gpu_in
 
     assert output["present"].to_pylist() == [True, False, False, True]
     assert len(fake_gpu_index.windows) > 1
-    assert all(
-        window.nbytes <= 9 or len(window) == 1 for window in fake_gpu_index.windows
-    )
+    assert all(window.nbytes <= 9 for window in fake_gpu_index.windows)
     assert get_gpu_fetch_metrics(output)["lookup_windows"] == len(
         fake_gpu_index.windows
     )
     assert get_gpu_fetch_metrics(output)["payload_take_calls"] == 0
+
+    with pytest.raises(MemoryError, match="exceeds max_lookup_bytes"):
+        fetcher(pa.table({"source_ref": ["value-larger-than-cap"]}))
 
 
 def test_private_take_ids_are_deduplicated_sorted_and_queue_bounded(

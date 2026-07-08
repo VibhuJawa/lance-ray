@@ -553,16 +553,16 @@ class _GpuExactKeyIndex:
 def _byte_windows(values: pa.Array, max_bytes: int) -> Iterator[pa.Array]:
     """Yield non-empty Arrow slices whose encoded size is at most ``max_bytes``.
 
-    A single oversized value is yielded alone.  Binary search keeps this cheap
-    for variable-width URL columns while enforcing a hard GPU transfer bound.
+    Binary search keeps this cheap for variable-width URL columns.  A single
+    oversized key fails closed rather than violating the GPU transfer bound.
     """
 
     start = 0
     while start < len(values):
         if values.slice(start, 1).nbytes > max_bytes:
-            yield values.slice(start, 1)
-            start += 1
-            continue
+            raise MemoryError(
+                f"one encoded lookup key exceeds max_lookup_bytes={max_bytes}"
+            )
         low, high = 1, len(values) - start
         while low < high:
             middle = (low + high + 1) // 2
