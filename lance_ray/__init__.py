@@ -15,6 +15,12 @@ from .datasink import LanceFragmentCommitter
 
 # Fragment API imports
 from .fragment import LanceFragmentWriter
+from .gpu import (
+    GpuLanceColumnFetcher,
+    GpuLanceFetchConfig,
+    fetch_lance_columns_on_gpu,
+    get_gpu_fetch_metrics,
+)
 from .index import create_index, create_scalar_index, optimize_indices
 from .io import (
     add_columns,
@@ -44,4 +50,8 @@ __all__ = [
     "compact_database",
     "LanceFragmentWriter",
     "LanceFragmentCommitter",
+    "GpuLanceColumnFetcher",
+    "GpuLanceFetchConfig",
+    "fetch_lance_columns_on_gpu",
+    "get_gpu_fetch_metrics",
 ]

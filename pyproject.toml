@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lance-ray"
-version = "0.4.2"
+version = "0.5.0"
 description = "Ray integration for Lance"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
@@ -23,8 +23,9 @@ classifiers = [
 ]
 
 dependencies = [
+    "fsspec>=2024.10.0",
     "ray[data]>=2.41.0",
-    "pylance>=8.0.0b11",
+    "pylance==9.0.0b11",
     "lance-namespace",
     "packaging",
     "pyarrow>=17.0.0",
@@ -43,6 +44,9 @@ docs = [
     "mkdocs>=1.5.0",
     "mkdocs-material>=9.0.0",
     "mkdocs-awesome-pages-plugin>=2.9.0",
+]
+gpu = [
+    "cudf-cu12==25.10.*; python_version>='3.11' and platform_system=='Linux' and platform_machine=='x86_64'",
 ]
 
 [project.urls]
@@ -75,5 +79,16 @@ source = ["lance_ray"]
 omit = ["*/tests/*", "*/__init__.py"]
 
 [tool.uv]
-extra-index-url = ["https://pypi.fury.io/lance-format"]
 index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+
+[[tool.uv.index]]
+name = "lance-format"
+url = "https://pypi.fury.io/lance-format"
+explicit = true
+
+[tool.uv.sources]
+pylance = { index = "lance-format" }
