@@ -46,7 +46,7 @@ docs = [
     "mkdocs-awesome-pages-plugin>=2.9.0",
 ]
 gpu = [
-    "cudf-cu12==25.10.*; python_version>='3.11' and platform_system=='Linux' and platform_machine=='x86_64'",
+    "cudf-cu12>=26.6,<26.7; python_version>='3.11' and platform_system=='Linux' and platform_machine=='x86_64'",
 ]
 
 [project.urls]
