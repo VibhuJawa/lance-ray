@@ -271,8 +271,14 @@ def test_fetch_preserves_arrow_order_and_reports_sparse_io(
     assert metrics["payload_bytes"] == 57
     assert metrics["lance_read_iops"] >= 0
     assert metrics["lance_read_bytes"] >= metrics["payload_bytes"]
+    assert metrics["payload_read_planning_seconds"] >= 0
+    assert metrics["payload_read_execution_seconds"] > 0
+    assert metrics["payload_fetch_seconds"] >= (
+        metrics["payload_read_planning_seconds"]
+        + metrics["payload_read_execution_seconds"]
+    )
     assert metrics["physical_read_operations_per_second"] == pytest.approx(
-        metrics["lance_read_iops"] / metrics["payload_fetch_seconds"]
+        metrics["lance_read_iops"] / metrics["payload_read_execution_seconds"]
     )
     assert metrics["average_physical_read_bytes"] >= 0
     assert metrics["physical_reads_per_unique_payload"] >= 0
@@ -335,6 +341,46 @@ def test_private_take_ids_are_deduplicated_sorted_and_queue_bounded(
     metrics = get_gpu_fetch_metrics(output)
     assert metrics["payload_take_calls"] == 2
     assert metrics["max_pending_fetch_batches"] == 1
+
+
+def test_private_read_execution_timer_excludes_planning(
+    tmp_path: Path, fake_gpu_index, monkeypatch
+):
+    dataset, mapping = _stable_dataset(tmp_path)
+    fake_gpu_index.mapping = mapping
+    fetcher = GpuLanceColumnFetcher(
+        _config(dataset, fetch_batch_size=4, max_pending_fetch_batches=1)
+    )
+    clock_seconds = 0.0
+
+    class Clock:
+        @staticmethod
+        def perf_counter() -> float:
+            return clock_seconds
+
+    original_plan = gpu_mod._plan_locality_reads
+
+    def timed_plan(*args, **kwargs):
+        nonlocal clock_seconds
+        plan = original_plan(*args, **kwargs)
+        clock_seconds += 7.0
+        return plan
+
+    def timed_take_rows(_self, row_ids, columns=None, **_kwargs):
+        nonlocal clock_seconds
+        clock_seconds += 3.0
+        return pa.table({name: [None] * len(row_ids) for name in columns})
+
+    monkeypatch.setattr(gpu_mod, "time", Clock)
+    monkeypatch.setattr(gpu_mod, "_plan_locality_reads", timed_plan)
+    monkeypatch.setattr(type(fetcher._dataset), "_take_rows", timed_take_rows)
+
+    result = fetcher._take_rows([2, 1, 2])
+
+    assert result.metrics["payload_take_calls"] == 1
+    assert result.metrics["payload_read_planning_seconds"] == 7.0
+    assert result.metrics["payload_read_execution_seconds"] == 3.0
+    fetcher.close()
 
 
 def test_missing_error_and_stale_sidecar_are_detected(tmp_path: Path, fake_gpu_index):

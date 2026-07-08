@@ -909,6 +909,7 @@ class GpuLanceColumnFetcher:
 
     def _take_rows(self, row_ids: list[int]) -> _PayloadReadResult:
         projected = self._projected_columns()
+        planning_started = time.perf_counter()
         plan = _plan_locality_reads(
             row_ids,
             manifest=self._manifest,
@@ -918,6 +919,7 @@ class GpuLanceColumnFetcher:
             high_density_threshold=self.config.high_density_threshold,
             max_coalesced_range_gap=self.config.max_coalesced_range_gap,
         )
+        planning_seconds = time.perf_counter() - planning_started
 
         def read_operation(operation: _PrivateReadOperation) -> _PayloadReadBatch:
             if operation.strategy == "take_rows":
@@ -993,7 +995,9 @@ class GpuLanceColumnFetcher:
                 next_operation += 1
             peak_pending = max(peak_pending, len(pending))
 
-        if projected:
+        execution_seconds = 0.0
+        if projected and plan.operations:
+            execution_started = time.perf_counter()
             fill_queue()
             try:
                 while pending:
@@ -1005,6 +1009,7 @@ class GpuLanceColumnFetcher:
                 for future in pending:
                     future.cancel()
                 raise
+            execution_seconds = time.perf_counter() - execution_started
 
         batches = tuple(completed[index] for index in range(len(completed)))
         take_calls = len(plan.operations) if projected else 0
@@ -1018,6 +1023,8 @@ class GpuLanceColumnFetcher:
             metrics={
                 "payload_take_calls": take_calls,
                 "payload_take_rows": len(plan.row_ids),
+                "payload_read_planning_seconds": planning_seconds,
+                "payload_read_execution_seconds": execution_seconds,
                 "rows_per_payload_take": (
                     len(plan.row_ids) / take_calls if take_calls else 0.0
                 ),
@@ -1130,6 +1137,9 @@ class GpuLanceColumnFetcher:
             row_id for batch in read_result.batches for row_id in batch.row_ids
         )
         fetch_seconds = time.perf_counter() - fetch_started
+        read_execution_seconds = float(
+            read_result.metrics["payload_read_execution_seconds"]
+        )
 
         expected_payload_rows = len(key_to_row_id) if self._projected_columns() else 0
         if len(fetched_row_ids) != expected_payload_rows:
@@ -1209,7 +1219,9 @@ class GpuLanceColumnFetcher:
             "lance_read_iops": int(io_stats.read_iops),
             "lance_read_bytes": int(io_stats.read_bytes),
             "physical_read_operations_per_second": (
-                float(io_stats.read_iops) / fetch_seconds if fetch_seconds else 0.0
+                float(io_stats.read_iops) / read_execution_seconds
+                if read_execution_seconds
+                else 0.0
             ),
             "average_physical_read_bytes": (
                 float(io_stats.read_bytes) / io_stats.read_iops

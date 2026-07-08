@@ -74,7 +74,12 @@ estimate for object-store coalescing. `max_lookup_bytes` independently provides
 a hard cap on each Arrow-to-GPU lookup window. Per-batch sparse-call, I/O, and
 timing measurements, including physical read operations/s and average read
 size, are available through `get_gpu_fetch_metrics` when Arrow schema metadata
-is preserved by the downstream operation.
+is preserved by the downstream operation. `payload_fetch_seconds` covers the
+whole payload phase, including coordinate planning, private reads, and Arrow
+assembly. `payload_read_planning_seconds` isolates deduplication, sorting, and
+locality planning, while `payload_read_execution_seconds` isolates the bounded
+private-read execution span. Physical read operations/s uses the latter as its
+denominator so planner work cannot suppress the reported storage I/O rate.
 
 Mapped stable IDs are deduplicated and sorted before private `_take_rows`
 calls. `fetch_batch_size`, `io_threads`, and `max_pending_fetch_batches`
