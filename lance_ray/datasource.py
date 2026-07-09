@@ -1,5 +1,11 @@
+import hashlib
 import inspect
-from collections.abc import Iterator
+import json
+import pickle
+import threading
+from collections import Counter, OrderedDict
+from collections.abc import Callable, Iterator, Mapping
+from functools import partial
 from typing import TYPE_CHECKING, Any, Optional
 
 import pyarrow as pa
@@ -18,6 +24,172 @@ from .utils import (
 
 if TYPE_CHECKING:
     import lance
+
+
+_WORKER_DATASET_CACHE: OrderedDict[str, "lance.LanceDataset"] = OrderedDict()
+_WORKER_DATASET_CACHE_LOCK = threading.RLock()
+_WORKER_DATASET_CACHE_STATS: Counter[str] = Counter()
+_WORKER_DATASET_CACHE_METRIC = None
+
+
+def _validate_cache_size(name: str, value: Optional[int]) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"'{name}' must be an integer or None")
+    if value < 0:
+        raise ValueError(f"'{name}' must be non-negative")
+
+
+def _validate_worker_dataset_cache_size(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("'worker_dataset_cache_size' must be an integer")
+    if value < 0:
+        raise ValueError("'worker_dataset_cache_size' must be non-negative")
+
+
+def _worker_cache_config(
+    index_cache_size_bytes: Optional[int],
+    metadata_cache_size_bytes: Optional[int],
+    worker_dataset_cache_size: int,
+) -> dict[str, Any]:
+    policy = "bounded_exact_dataset_lru" if worker_dataset_cache_size else "disabled"
+    identity_fields = {
+        "index_cache_size_bytes": index_cache_size_bytes,
+        "metadata_cache_size_bytes": metadata_cache_size_bytes,
+        "policy": policy,
+        "scope": "ray_worker_process",
+        "worker_dataset_cache_size": worker_dataset_cache_size,
+    }
+    encoded = json.dumps(
+        identity_fields, sort_keys=True, separators=(",", ":")
+    ).encode()
+    return {
+        **identity_fields,
+        "config_id": hashlib.sha256(encoded).hexdigest()[:16],
+    }
+
+
+def _canonical_cache_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (
+                    (_canonical_cache_value(key), _canonical_cache_value(item))
+                    for key, item in value.items()
+                ),
+                key=lambda item: pickle.dumps(item[0], protocol=5),
+            )
+        )
+    if isinstance(value, list | tuple):
+        return tuple(_canonical_cache_value(item) for item in value)
+    if isinstance(value, set | frozenset):
+        return tuple(
+            sorted(
+                (_canonical_cache_value(item) for item in value),
+                key=lambda item: pickle.dumps(item, protocol=5),
+            )
+        )
+    try:
+        hash(value)
+    except TypeError:
+        return pickle.dumps(value, protocol=5)
+    return value
+
+
+def _worker_dataset_cache_key(
+    *,
+    uri: str,
+    version: int,
+    storage_options: Optional[dict[str, str]],
+    manifest: bytes | None,
+    namespace_impl: Optional[str],
+    namespace_properties: Optional[dict[str, str]],
+    table_id: Optional[list[str]],
+    base_store_params: Optional[dict[str, dict[str, Any]]],
+    index_cache_size_bytes: Optional[int],
+    metadata_cache_size_bytes: Optional[int],
+) -> str:
+    identity = _canonical_cache_value(
+        {
+            "base_store_params": base_store_params,
+            "index_cache_size_bytes": index_cache_size_bytes,
+            "manifest_sha256": (
+                hashlib.sha256(manifest).digest() if manifest is not None else None
+            ),
+            "metadata_cache_size_bytes": metadata_cache_size_bytes,
+            "namespace_impl": namespace_impl,
+            "namespace_properties": namespace_properties,
+            "storage_options": storage_options,
+            "table_id": table_id,
+            "uri": uri,
+            "version": version,
+        }
+    )
+    return hashlib.sha256(pickle.dumps(identity, protocol=5)).hexdigest()
+
+
+def _record_worker_cache_events(events: list[str], config_id: str) -> None:
+    if not events:
+        return
+
+    global _WORKER_DATASET_CACHE_METRIC
+    with _WORKER_DATASET_CACHE_LOCK:
+        _WORKER_DATASET_CACHE_STATS.update(events)
+
+    try:
+        if _WORKER_DATASET_CACHE_METRIC is None:
+            from ray.util.metrics import Counter as RayCounter
+
+            _WORKER_DATASET_CACHE_METRIC = RayCounter(
+                "lance_ray_worker_dataset_cache_events",
+                description=(
+                    "Lance dataset reconstruction cache events in Ray worker processes"
+                ),
+                tag_keys=("event", "cache_config_id"),
+            )
+        for event in events:
+            _WORKER_DATASET_CACHE_METRIC.inc(
+                tags={"event": event, "cache_config_id": config_id}
+            )
+    except Exception:
+        # Cache telemetry must never make a data read fail.
+        pass
+
+
+def _get_worker_lance_dataset(
+    *,
+    cache_key: str,
+    cache_size: int,
+    cache_config_id: str,
+    factory: Callable[[], "lance.LanceDataset"],
+) -> "lance.LanceDataset":
+    if cache_size == 0:
+        with _WORKER_DATASET_CACHE_LOCK:
+            evictions = len(_WORKER_DATASET_CACHE)
+            _WORKER_DATASET_CACHE.clear()
+        dataset = factory()
+        _record_worker_cache_events(
+            ["bypass", *(["eviction"] * evictions)], cache_config_id
+        )
+        return dataset
+
+    events: list[str] = []
+    with _WORKER_DATASET_CACHE_LOCK:
+        dataset = _WORKER_DATASET_CACHE.get(cache_key)
+        if dataset is not None:
+            _WORKER_DATASET_CACHE.move_to_end(cache_key)
+            events.append("hit")
+        else:
+            dataset = factory()
+            _WORKER_DATASET_CACHE[cache_key] = dataset
+            events.append("miss")
+        while len(_WORKER_DATASET_CACHE) > cache_size:
+            _WORKER_DATASET_CACHE.popitem(last=False)
+            events.append("eviction")
+
+    _record_worker_cache_events(events, cache_config_id)
+    return dataset
 
 
 class LanceDatasource(Datasource):
@@ -43,11 +215,40 @@ class LanceDatasource(Datasource):
         fragment_ids: Optional[list[int]] = None,
         namespace_impl: Optional[str] = None,
         namespace_properties: Optional[dict[str, str]] = None,
+        index_cache_size_bytes: Optional[int] = None,
+        metadata_cache_size_bytes: Optional[int] = None,
+        worker_dataset_cache_size: int = 1,
         with_metadata: bool = False,
     ):
         _check_import(self, module="lance", package="pylance")
 
         self._dataset_options = dict(dataset_options or {})
+        reserved_dataset_options = {
+            "index_cache_size",
+            "index_cache_size_bytes",
+            "metadata_cache_size",
+            "metadata_cache_size_bytes",
+            "session",
+        }
+        conflicting_options = sorted(
+            reserved_dataset_options.intersection(self._dataset_options)
+        )
+        if conflicting_options:
+            raise ValueError(
+                "Lance session/cache settings must use the explicit read_lance "
+                f"arguments, not dataset_options: {conflicting_options}"
+            )
+        _validate_cache_size("index_cache_size_bytes", index_cache_size_bytes)
+        _validate_cache_size("metadata_cache_size_bytes", metadata_cache_size_bytes)
+        _validate_worker_dataset_cache_size(worker_dataset_cache_size)
+        self._index_cache_size_bytes = index_cache_size_bytes
+        self._metadata_cache_size_bytes = metadata_cache_size_bytes
+        self._worker_dataset_cache_size = worker_dataset_cache_size
+        self._worker_cache_config = _worker_cache_config(
+            index_cache_size_bytes,
+            metadata_cache_size_bytes,
+            worker_dataset_cache_size,
+        )
         dataset_base_store_params = self._dataset_options.pop("base_store_params", None)
         if (
             base_store_params is not None
@@ -94,16 +295,31 @@ class LanceDatasource(Datasource):
         self._with_metadata = with_metadata
 
         self._lance_ds = None
+        self._driver_session = None
         self._fragments = None
+
+    @property
+    def worker_cache_config(self) -> dict[str, Any]:
+        """Return the non-secret worker cache identity used for this read."""
+        return dict(self._worker_cache_config)
+
+    def get_name(self) -> str:
+        """Identify the cache configuration in Ray Data plans and stats."""
+        return f"Lance-{self._worker_cache_config['config_id']}"
 
     @property
     def lance_dataset(self) -> "lance.LanceDataset":
         if self._lance_ds is None:
             import lance
 
+            self._driver_session = lance.Session(
+                index_cache_size_bytes=self._index_cache_size_bytes,
+                metadata_cache_size_bytes=self._metadata_cache_size_bytes,
+            )
             dataset_options = self._dataset_options.copy()
             dataset_options["uri"] = self._uri
             dataset_options["storage_options"] = self._storage_options
+            dataset_options["session"] = self._driver_session
             ns_kwargs = get_namespace_kwargs(
                 self._namespace_impl, self._namespace_properties, self._table_id
             )
@@ -131,12 +347,18 @@ class LanceDatasource(Datasource):
 
     def _get_storage_options(self) -> dict[str, str] | None:
         try:
-            return self.lance_dataset.initial_storage_options
+            storage_options = self.lance_dataset.initial_storage_options
+            if storage_options is not None:
+                return storage_options
         except AttributeError:
-            try:
-                return self._lance_ds._storage_options
-            except AttributeError:
-                return None
+            pass
+        try:
+            storage_options = self._lance_ds._storage_options
+            if storage_options is not None:
+                return storage_options
+        except AttributeError:
+            pass
+        return self._storage_options
 
     def _get_serialized_manifest(self) -> bytes | None:
         try:
@@ -162,6 +384,22 @@ class LanceDatasource(Datasource):
         namespace_properties = self._namespace_properties
         table_id = self._table_id
         base_store_params = self._base_store_params
+        index_cache_size_bytes = self._index_cache_size_bytes
+        metadata_cache_size_bytes = self._metadata_cache_size_bytes
+        worker_dataset_cache_size = self._worker_dataset_cache_size
+        worker_cache_config_id = self._worker_cache_config["config_id"]
+        worker_dataset_cache_key = _worker_dataset_cache_key(
+            uri=dataset_uri,
+            version=dataset_version,
+            storage_options=dataset_storage_options,
+            manifest=serialized_manifest,
+            namespace_impl=namespace_impl,
+            namespace_properties=namespace_properties,
+            table_id=table_id,
+            base_store_params=base_store_params,
+            index_cache_size_bytes=index_cache_size_bytes,
+            metadata_cache_size_bytes=metadata_cache_size_bytes,
+        )
 
         for fragments in array_split(self.fragments, parallelism):
             if len(fragments) == 0:
@@ -201,21 +439,25 @@ class LanceDatasource(Datasource):
                 )
 
             read_task = ReadTask(
-                lambda fids=fragment_ids, uri=dataset_uri, version=dataset_version, storage_options=dataset_storage_options, manifest=serialized_manifest, ns_impl=namespace_impl, ns_props=namespace_properties, tbl_id=table_id, base_params=base_store_params, scanner_options=self._scanner_options, retry_params=self._retry_params, with_metadata=self._with_metadata: (
-                    _read_fragments_with_retry(
-                        fids,
-                        uri,
-                        version,
-                        storage_options,
-                        manifest,
-                        ns_impl,
-                        ns_props,
-                        tbl_id,
-                        base_params,
-                        scanner_options,
-                        retry_params,
-                        with_metadata,
-                    )
+                partial(
+                    _read_fragments_with_retry,
+                    fragment_ids=fragment_ids,
+                    uri=dataset_uri,
+                    version=dataset_version,
+                    storage_options=dataset_storage_options,
+                    manifest=serialized_manifest,
+                    namespace_impl=namespace_impl,
+                    namespace_properties=namespace_properties,
+                    table_id=table_id,
+                    base_store_params=base_store_params,
+                    scanner_options=self._scanner_options,
+                    retry_params=self._retry_params,
+                    index_cache_size_bytes=index_cache_size_bytes,
+                    metadata_cache_size_bytes=metadata_cache_size_bytes,
+                    worker_dataset_cache_size=worker_dataset_cache_size,
+                    worker_cache_config_id=worker_cache_config_id,
+                    worker_dataset_cache_key=worker_dataset_cache_key,
+                    with_metadata=self._with_metadata,
                 ),
                 metadata,
             )
@@ -241,35 +483,48 @@ def _read_fragments_with_retry(
     uri: str,
     version: int,
     storage_options: Optional[dict[str, str]],
-    manifest: bytes,
+    manifest: bytes | None,
     namespace_impl: Optional[str],
     namespace_properties: Optional[dict[str, str]],
     table_id: Optional[list[str]],
     base_store_params: Optional[dict[str, dict[str, Any]]],
     scanner_options: dict[str, Any],
     retry_params: dict[str, Any],
+    index_cache_size_bytes: Optional[int],
+    metadata_cache_size_bytes: Optional[int],
+    worker_dataset_cache_size: int,
+    worker_cache_config_id: str,
+    worker_dataset_cache_key: str,
     with_metadata: bool = False,
 ) -> Iterator[pa.Table]:
-    namespace_kwargs = get_namespace_kwargs(
-        namespace_impl, namespace_properties, table_id
-    )
-    base_store_params_kwargs = {}
-    if base_store_params:
-        base_store_params_kwargs = {"base_store_params": base_store_params}
-
     import lance
 
-    ds_kwargs: dict[str, Any] = {
-        "uri": uri,
-        "version": version,
-        "storage_options": storage_options,
-    }
-    if manifest is not None:
-        ds_kwargs["serialized_manifest"] = manifest
-    ds_kwargs.update(namespace_kwargs)
-    ds_kwargs.update(base_store_params_kwargs)
+    def create_dataset() -> "lance.LanceDataset":
+        namespace_kwargs = get_namespace_kwargs(
+            namespace_impl, namespace_properties, table_id
+        )
+        ds_kwargs: dict[str, Any] = {
+            "uri": uri,
+            "version": version,
+            "storage_options": storage_options,
+            "session": lance.Session(
+                index_cache_size_bytes=index_cache_size_bytes,
+                metadata_cache_size_bytes=metadata_cache_size_bytes,
+            ),
+        }
+        if manifest is not None:
+            ds_kwargs["serialized_manifest"] = manifest
+        if base_store_params:
+            ds_kwargs["base_store_params"] = base_store_params
+        ds_kwargs.update(namespace_kwargs)
+        return lance.LanceDataset(**ds_kwargs)
 
-    lance_ds = lance.LanceDataset(**ds_kwargs)
+    lance_ds = _get_worker_lance_dataset(
+        cache_key=worker_dataset_cache_key,
+        cache_size=worker_dataset_cache_size,
+        cache_config_id=worker_cache_config_id,
+        factory=create_dataset,
+    )
 
     return call_with_retry(
         lambda: _read_fragments(fragment_ids, lance_ds, scanner_options, with_metadata),

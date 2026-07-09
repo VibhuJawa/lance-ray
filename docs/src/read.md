@@ -10,7 +10,10 @@ read_lance(
     table_id=None, 
     columns=None, 
     filter=None, 
-    storage_options=None, 
+    storage_options=None,
+    index_cache_size_bytes=None,
+    metadata_cache_size_bytes=None,
+    worker_dataset_cache_size=1,
     **kwargs)
 ```
 
@@ -26,11 +29,29 @@ Read a Lance dataset and return a Ray Dataset.
 - `storage_options`: Optional storage configuration dictionary
 - `base_store_params`: Optional runtime storage options keyed by registered base path URI, used for BlobV2 references outside the dataset root
 - `scanner_options`: Optional scanner configuration dictionary
+- `index_cache_size_bytes`: Per-session Lance index-cache capacity on the driver and each Ray worker
+- `metadata_cache_size_bytes`: Per-session Lance metadata-cache capacity on the driver and each Ray worker
+- `worker_dataset_cache_size`: Exact pinned dataset/session reconstructions retained per Ray worker; zero disables reuse
 - `ray_remote_args`: Optional kwargs for Ray remote tasks
 - `concurrency`: Optional maximum number of concurrent Ray tasks
 - `override_num_blocks`: Optional override for number of output blocks
 
 **Returns:** Ray Dataset
+
+Worker reuse is process-local and opportunistic. Ray may execute consecutive
+read tasks on different worker processes, so a cache size of one bounds each
+worker without promising affinity. The cache key includes the resolved dataset
+URI and version, serialized-manifest digest, storage and namespace identity,
+base-store parameters, and both Lance cache sizes. It never reuses a session
+across different pinned snapshots or storage configurations.
+
+The Ray metrics exporter records
+`lance_ray_worker_dataset_cache_events_total` with `event` (`hit`, `miss`,
+`bypass`, or `eviction`) and the non-secret `cache_config_id` tag. The same
+configuration identity is available from `LanceDatasource.worker_cache_config`
+for benchmark run metadata and appears in the Ray Data source name as
+`Lance-<cache_config_id>`. Cache hit rates must be reported from all workers;
+driver construction alone does not prove worker reuse.
 
 ## GPU exact-key column fetch
 

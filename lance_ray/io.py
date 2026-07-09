@@ -50,6 +50,9 @@ def read_lance(
     fragment_ids: Optional[list[int]] = None,
     namespace_impl: Optional[str] = None,
     namespace_properties: Optional[dict[str, str]] = None,
+    index_cache_size_bytes: Optional[int] = None,
+    metadata_cache_size_bytes: Optional[int] = None,
+    worker_dataset_cache_size: int = 1,
     ray_remote_args: Optional[dict[str, Any]] = None,
     concurrency: Optional[int] = None,
     override_num_blocks: Optional[int] = None,
@@ -102,6 +105,14 @@ def read_lance(
             Used together with namespace_properties and table_id.
         namespace_properties: Properties for connecting to the namespace.
             Used together with namespace_impl and table_id.
+        index_cache_size_bytes: Maximum bytes for the Lance index cache in each
+            driver and worker session. ``None`` uses the pinned PyLance default.
+        metadata_cache_size_bytes: Maximum bytes for the Lance metadata cache in
+            each driver and worker session. ``None`` uses the pinned PyLance default.
+        worker_dataset_cache_size: Maximum exact dataset/session reconstructions
+            retained in each Ray worker process. The default of one reuses a pinned
+            dataset when Ray schedules successive read tasks on the same worker.
+            Set to zero to reconstruct the dataset and session for every read task.
         ray_remote_args: kwargs passed to :func:`ray.remote` in the read tasks.
         concurrency: The maximum number of Ray tasks to run concurrently. Set this
             to control number of tasks to run concurrently. This doesn't change the
@@ -133,6 +144,9 @@ def read_lance(
         fragment_ids=fragment_ids,
         namespace_impl=namespace_impl,
         namespace_properties=namespace_properties,
+        index_cache_size_bytes=index_cache_size_bytes,
+        metadata_cache_size_bytes=metadata_cache_size_bytes,
+        worker_dataset_cache_size=worker_dataset_cache_size,
         with_metadata=with_metadata,
     )
 
