@@ -262,7 +262,11 @@ def test_fetch_preserves_arrow_order_and_reports_sparse_io(
     assert metrics["missing_unique_keys"] == 1
     assert metrics["payload_take_calls"] == 2
     assert metrics["take_rows_calls"] == 2
+    assert metrics["fragment_take_calls"] == 0
+    assert metrics["fragment_scan_calls"] == 0
     assert metrics["take_scan_calls"] == 0
+    assert metrics["take_scan_ranges"] == 0
+    assert metrics["planned_scan_rows"] == 0
     assert metrics["stage_windows"] == 1
     assert metrics["sparse_calls_without_coalescing"] == 3
     assert metrics["sparse_calls_avoided"] == 1
@@ -420,8 +424,8 @@ def test_adaptive_locality_planner_selects_all_private_read_strategies():
 
     assert [operation.strategy for operation in plan.operations] == [
         "take_rows",
-        "take_scan_ranges",
-        "take_scan_fragment",
+        "fragment_take",
+        "fragment_scan",
     ]
     assert plan.operations[0].row_ids == (0, 2)
     assert plan.operations[1].ranges == ((10, 12), (13, 14))
@@ -429,9 +433,44 @@ def test_adaptive_locality_planner_selects_all_private_read_strategies():
     assert plan.sparse_fragments == 1
     assert plan.range_fragments == 1
     assert plan.sequential_fragments == 1
-    assert plan.take_scan_ranges == 3
-    assert plan.planned_scan_rows == 13
+    assert plan.fragment_take_ranges == 2
+    assert plan.planned_fragment_read_rows == 13
     assert plan.range_overread_rows == 2
+
+
+def test_adaptive_locality_packs_sparse_rows_across_fragments_globally():
+    manifest = gpu_mod._StableGlobalOrdinalManifest(
+        fragment_starts=(0, 10, 20, 30),
+        fragment_rows=(10, 10, 10, 10),
+        total_rows=40,
+    )
+    row_ids = [0, 10, 20, 30]
+
+    adaptive = gpu_mod._plan_locality_reads(
+        row_ids,
+        manifest=manifest,
+        fetch_batch_size=3,
+        payload_read_mode="adaptive_unmeasured",
+        medium_density_threshold=0.5,
+        high_density_threshold=0.9,
+        max_coalesced_range_gap=0,
+    )
+    sparse = gpu_mod._plan_locality_reads(
+        row_ids,
+        manifest=manifest,
+        fetch_batch_size=3,
+        payload_read_mode="sparse",
+        medium_density_threshold=0.5,
+        high_density_threshold=0.9,
+        max_coalesced_range_gap=0,
+    )
+
+    assert adaptive.operations == sparse.operations
+    assert [operation.row_ids for operation in adaptive.operations] == [
+        (0, 10, 20),
+        (30,),
+    ]
+    assert adaptive.sparse_fragments == 4
 
 
 def test_adaptive_locality_fetch_preserves_arrow_order(tmp_path: Path, fake_gpu_index):
@@ -457,8 +496,134 @@ def test_adaptive_locality_fetch_preserves_arrow_order(tmp_path: Path, fake_gpu_
     assert metrics["strategy_range_fragments"] == 1
     assert metrics["strategy_sequential_fragments"] == 1
     assert metrics["take_rows_calls"] == 0
-    assert metrics["take_scan_calls"] == 2
-    assert metrics["take_scan_ranges"] == 2
+    assert metrics["fragment_take_calls"] == 1
+    assert metrics["fragment_scan_calls"] == 1
+    assert metrics["fragment_take_ranges"] == 1
+    assert metrics["fragment_scan_batches"] == 1
+    assert metrics["take_scan_calls"] == 0
+    assert metrics["take_scan_ranges"] == 0
+    assert metrics["planned_scan_rows"] == metrics["planned_fragment_read_rows"]
+
+
+def test_adaptive_medium_reads_use_bounded_fragment_local_offsets(
+    tmp_path: Path, fake_gpu_index
+):
+    dataset, mapping = _stable_dataset(tmp_path)
+    fake_gpu_index.mapping = mapping
+    fetcher = GpuLanceColumnFetcher(
+        _config(
+            dataset,
+            payload_read_mode="adaptive_unmeasured",
+            fetch_batch_size=2,
+            medium_density_threshold=0.5,
+            high_density_threshold=0.9,
+            max_coalesced_range_gap=1,
+        )
+    )
+    take_calls = []
+    session_columns = []
+
+    class FakeSession:
+        def take(self, offsets):
+            take_calls.append(list(offsets))
+            return pa.table(
+                {
+                    "image": pa.array(
+                        [f"image-{offset}".encode() for offset in offsets],
+                        type=pa.large_binary(),
+                    ),
+                    "width": pa.array(offsets, type=pa.int32()),
+                }
+            )
+
+    class FakeFragment:
+        @staticmethod
+        def open_session(*, columns):
+            session_columns.append(list(columns))
+            return FakeSession()
+
+    fetcher._manifest = gpu_mod._StableGlobalOrdinalManifest(
+        fragment_starts=(0,),
+        fragment_rows=(5,),
+        total_rows=5,
+    )
+    fetcher._fragments = (FakeFragment(),)
+
+    result = fetcher._take_rows([4, 0, 2])
+
+    assert take_calls == [[0, 1], [2, 3], [4]]
+    assert session_columns == [["image", "width"]]
+    assert result.batches[0].row_ids == (0, 2, 4)
+    assert result.batches[0].table["image"].to_pylist() == [
+        b"image-0",
+        b"image-2",
+        b"image-4",
+    ]
+    assert result.metrics["fragment_take_calls"] == 3
+    assert result.metrics["fragment_take_ranges"] == 3
+    assert result.metrics["range_overread_rows"] == 2
+    fetcher.close()
+
+
+def test_adaptive_high_density_scan_streams_and_validates_physical_rows(
+    tmp_path: Path, fake_gpu_index
+):
+    dataset, mapping = _stable_dataset(tmp_path)
+    fake_gpu_index.mapping = mapping
+    fetcher = GpuLanceColumnFetcher(
+        _config(
+            dataset,
+            payload_read_mode="adaptive_unmeasured",
+            fetch_batch_size=2,
+            medium_density_threshold=0.2,
+            high_density_threshold=0.4,
+            take_scan_batch_readahead=3,
+        )
+    )
+    scan_calls = []
+
+    class FakeFragment:
+        def __init__(self, row_count):
+            self.row_count = row_count
+
+        def to_batches(self, *, columns, batch_size, batch_readahead):
+            scan_calls.append((list(columns), batch_size, batch_readahead))
+            for start in range(0, self.row_count, batch_size):
+                stop = min(start + batch_size, self.row_count)
+                offsets = list(range(start, stop))
+                yield pa.record_batch(
+                    [
+                        pa.array(
+                            [f"image-{offset}".encode() for offset in offsets],
+                            type=pa.large_binary(),
+                        ),
+                        pa.array(offsets, type=pa.int32()),
+                    ],
+                    names=["image", "width"],
+                )
+
+    fetcher._manifest = gpu_mod._StableGlobalOrdinalManifest(
+        fragment_starts=(0,),
+        fragment_rows=(5,),
+        total_rows=5,
+    )
+    fetcher._fragments = (FakeFragment(5),)
+
+    result = fetcher._take_rows([4, 1])
+
+    assert scan_calls == [(["image", "width"], 2, 3)]
+    assert result.batches[0].row_ids == (1, 4)
+    assert result.batches[0].table["image"].to_pylist() == [
+        b"image-1",
+        b"image-4",
+    ]
+    assert result.metrics["fragment_scan_calls"] == 1
+    assert result.metrics["fragment_scan_batches"] == 3
+
+    fetcher._fragments = (FakeFragment(4),)
+    with pytest.raises(RuntimeError, match="expected 5"):
+        fetcher._take_rows([1, 4])
+    fetcher.close()
 
 
 def test_opt_in_payload_key_validation_adds_key_projection(

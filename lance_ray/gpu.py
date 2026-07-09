@@ -12,7 +12,7 @@ import hashlib
 import json
 import sys
 import time
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -33,7 +33,7 @@ _METRICS_METADATA_KEY = b"lance-ray:gpu-column-fetch-metrics"
 _SIDECAR_CONTRACT_FORMAT = "nemo-curator-gpu-lance-sidecar-v2"
 _STABLE_ID_COVERAGE_DTYPE = "uint32"
 PayloadReadMode = Literal["sparse", "adaptive_unmeasured"]
-PrivateReadStrategy = Literal["take_rows", "take_scan_ranges", "take_scan_fragment"]
+PrivateReadStrategy = Literal["take_rows", "fragment_take", "fragment_scan"]
 
 
 def _canonical_json_bytes(value: dict[str, Any]) -> bytes:
@@ -304,6 +304,7 @@ class _StableGlobalOrdinalManifest:
 class _PrivateReadOperation:
     strategy: PrivateReadStrategy
     row_ids: tuple[int, ...]
+    fragment_index: Optional[int] = None
     ranges: tuple[tuple[int, int], ...] = ()
 
 
@@ -315,8 +316,8 @@ class _LocalityReadPlan:
     sparse_fragments: int
     range_fragments: int
     sequential_fragments: int
-    take_scan_ranges: int
-    planned_scan_rows: int
+    fragment_take_ranges: int
+    planned_fragment_read_rows: int
     range_overread_rows: int
 
 
@@ -324,6 +325,9 @@ class _LocalityReadPlan:
 class _PayloadReadBatch:
     table: pa.Table
     row_ids: tuple[int, ...]
+    fragment_take_calls: int = 0
+    fragment_scan_calls: int = 0
+    fragment_scan_batches: int = 0
 
 
 @dataclass(frozen=True)
@@ -579,7 +583,7 @@ def _coalesce_ordinal_ranges(
     *,
     max_gap_rows: int,
 ) -> tuple[tuple[int, int], ...]:
-    """Coalesce sorted stable ordinals into half-open private scan ranges."""
+    """Coalesce sorted stable ordinals into half-open fragment-local ranges."""
     if not row_ids:
         return ()
     ranges: list[tuple[int, int]] = []
@@ -596,6 +600,21 @@ def _coalesce_ordinal_ranges(
     return tuple(ranges)
 
 
+def _split_ordinal_ranges(
+    ranges: Sequence[tuple[int, int]],
+    *,
+    max_rows: int,
+) -> tuple[tuple[int, int], ...]:
+    """Split half-open ranges so every fragment take has a fixed row bound."""
+    bounded = []
+    for start, stop in ranges:
+        bounded.extend(
+            (offset, min(offset + max_rows, stop))
+            for offset in range(start, stop, max_rows)
+        )
+    return tuple(bounded)
+
+
 def _plan_locality_reads(  # noqa: PLR0913
     row_ids: Sequence[int],
     *,
@@ -606,7 +625,7 @@ def _plan_locality_reads(  # noqa: PLR0913
     high_density_threshold: float,
     max_coalesced_range_gap: int,
 ) -> _LocalityReadPlan:
-    """Plan measured sparse takes or opt-in, unmeasured locality scans."""
+    """Plan measured sparse takes or opt-in fragment-local reads."""
     ordered = tuple(sorted(set(row_ids)))
     for row_id in ordered:
         if row_id < 0 or row_id >= manifest.total_rows:
@@ -639,18 +658,30 @@ def _plan_locality_reads(  # noqa: PLR0913
             sparse_fragments=len(grouped),
             range_fragments=0,
             sequential_fragments=0,
-            take_scan_ranges=0,
-            planned_scan_rows=0,
+            fragment_take_ranges=0,
+            planned_fragment_read_rows=0,
             range_overread_rows=0,
         )
 
     operations_list: list[_PrivateReadOperation] = []
+    sparse_buffer: list[int] = []
     sparse_fragments = 0
     range_fragments = 0
     sequential_fragments = 0
-    take_scan_ranges = 0
-    planned_scan_rows = 0
+    fragment_take_ranges = 0
+    planned_fragment_read_rows = 0
     range_requested_rows = 0
+
+    def flush_sparse_buffer() -> None:
+        for start in range(0, len(sparse_buffer), fetch_batch_size):
+            operations_list.append(
+                _PrivateReadOperation(
+                    "take_rows",
+                    tuple(sparse_buffer[start : start + fetch_batch_size]),
+                )
+            )
+        sparse_buffer.clear()
+
     for fragment_index, fragment_row_ids in sorted(grouped.items()):
         fragment_start = manifest.fragment_starts[fragment_index]
         fragment_rows = manifest.fragment_rows[fragment_index]
@@ -658,33 +689,51 @@ def _plan_locality_reads(  # noqa: PLR0913
         requested = tuple(fragment_row_ids)
         density = len(requested) / fragment_rows
         if density >= high_density_threshold:
+            flush_sparse_buffer()
             ranges = ((fragment_start, fragment_stop),)
             operations_list.append(
-                _PrivateReadOperation("take_scan_fragment", requested, ranges)
+                _PrivateReadOperation(
+                    "fragment_scan",
+                    requested,
+                    fragment_index=fragment_index,
+                    ranges=ranges,
+                )
             )
             sequential_fragments += 1
         elif density >= medium_density_threshold:
-            ranges = _coalesce_ordinal_ranges(
-                requested,
-                max_gap_rows=max_coalesced_range_gap,
+            flush_sparse_buffer()
+            ranges = _split_ordinal_ranges(
+                _coalesce_ordinal_ranges(
+                    requested,
+                    max_gap_rows=max_coalesced_range_gap,
+                ),
+                max_rows=fetch_batch_size,
             )
             operations_list.append(
-                _PrivateReadOperation("take_scan_ranges", requested, ranges)
+                _PrivateReadOperation(
+                    "fragment_take",
+                    requested,
+                    fragment_index=fragment_index,
+                    ranges=ranges,
+                )
             )
             range_fragments += 1
         else:
-            operations_list.extend(
-                _PrivateReadOperation(
-                    "take_rows",
-                    requested[start : start + fetch_batch_size],
-                )
-                for start in range(0, len(requested), fetch_batch_size)
-            )
+            sparse_buffer.extend(requested)
             sparse_fragments += 1
             continue
-        take_scan_ranges += len(ranges)
-        planned_scan_rows += sum(stop - start for start, stop in ranges)
+        fragment_take_ranges += (
+            len(ranges) if operations_list[-1].strategy == "fragment_take" else 0
+        )
+        planned_fragment_read_rows += sum(stop - start for start, stop in ranges)
         range_requested_rows += len(requested)
+
+    flush_sparse_buffer()
+    planned_row_ids = tuple(
+        row_id for operation in operations_list for row_id in operation.row_ids
+    )
+    if planned_row_ids != ordered:
+        raise RuntimeError("locality read plan changed stable row-ID order or coverage")
 
     return _LocalityReadPlan(
         row_ids=ordered,
@@ -693,9 +742,9 @@ def _plan_locality_reads(  # noqa: PLR0913
         sparse_fragments=sparse_fragments,
         range_fragments=range_fragments,
         sequential_fragments=sequential_fragments,
-        take_scan_ranges=take_scan_ranges,
-        planned_scan_rows=planned_scan_rows,
-        range_overread_rows=planned_scan_rows - range_requested_rows,
+        fragment_take_ranges=fragment_take_ranges,
+        planned_fragment_read_rows=planned_fragment_read_rows,
+        range_overread_rows=planned_fragment_read_rows - range_requested_rows,
     )
 
 
@@ -811,6 +860,7 @@ class GpuLanceColumnFetcher:
             fragment_rows=tuple(fragment_row_counts),
             total_rows=dataset_rows,
         )
+        self._fragments = tuple(fragments)
         self._dataset_rows = dataset_rows
         required = {config.dataset_key_column, *config.columns}
         missing = sorted(required - set(self._dataset.schema.names))
@@ -934,47 +984,127 @@ class GpuLanceColumnFetcher:
                     )
                 return _PayloadReadBatch(table, operation.row_ids)
 
-            batches = list(
-                self._dataset._ds.take_scan(
-                    list(operation.ranges),
-                    columns=projected,
-                    batch_readahead=self.config.take_scan_batch_readahead,
-                )
-            )
-            if len(batches) != len(operation.ranges):
+            if operation.fragment_index is None:
                 raise RuntimeError(
-                    f"private Lance take_scan returned {len(batches)} batches for "
-                    f"{len(operation.ranges)} ranges"
+                    f"{operation.strategy} read is missing its manifest fragment"
                 )
-            requested = set(operation.row_ids)
+            fragment_index = operation.fragment_index
+            fragment = self._fragments[fragment_index]
+            fragment_start = self._manifest.fragment_starts[fragment_index]
+            fragment_rows = self._manifest.fragment_rows[fragment_index]
+
+            if operation.strategy == "fragment_take":
+                session = fragment.open_session(columns=projected)
+                filtered_tables = []
+                filtered_row_ids = []
+                for start, stop in operation.ranges:
+                    if stop - start > self.config.fetch_batch_size:
+                        raise RuntimeError(
+                            f"fragment take range [{start}, {stop}) exceeds "
+                            f"fetch_batch_size={self.config.fetch_batch_size}"
+                        )
+                    local_start = start - fragment_start
+                    local_stop = stop - fragment_start
+                    if local_start < 0 or local_stop > fragment_rows:
+                        raise RuntimeError(
+                            f"fragment take range [{start}, {stop}) is outside "
+                            f"fragment {fragment_index}"
+                        )
+                    table = session.take(list(range(local_start, local_stop)))
+                    if table.num_rows != stop - start:
+                        raise RuntimeError(
+                            f"fragment {fragment_index} take range [{start}, {stop}) "
+                            f"returned {table.num_rows} rows"
+                        )
+                    requested_start = bisect_left(operation.row_ids, start)
+                    requested_stop = bisect_left(operation.row_ids, stop)
+                    requested = operation.row_ids[requested_start:requested_stop]
+                    if not requested:
+                        raise RuntimeError(
+                            f"fragment take range [{start}, {stop}) has no requested rows"
+                        )
+                    filtered_tables.append(
+                        table.take(
+                            pa.array(
+                                [row_id - start for row_id in requested],
+                                type=pa.int64(),
+                            )
+                        )
+                    )
+                    filtered_row_ids.extend(requested)
+                returned_row_ids = tuple(filtered_row_ids)
+                if returned_row_ids != operation.row_ids:
+                    raise RuntimeError(
+                        f"fragment {fragment_index} take changed stable row-ID "
+                        "order or coverage"
+                    )
+                table = (
+                    pa.concat_tables(filtered_tables)
+                    if len(filtered_tables) > 1
+                    else filtered_tables[0]
+                )
+                return _PayloadReadBatch(
+                    table,
+                    returned_row_ids,
+                    fragment_take_calls=len(operation.ranges),
+                )
+
             filtered_tables = []
             filtered_row_ids = []
-            for (start, stop), batch in zip(operation.ranges, batches, strict=True):
-                if batch.num_rows != stop - start:
+            scanned_rows = 0
+            scan_batches = 0
+            for batch in fragment.to_batches(
+                columns=projected,
+                batch_size=self.config.fetch_batch_size,
+                batch_readahead=self.config.take_scan_batch_readahead,
+            ):
+                if batch.num_rows <= 0:
                     raise RuntimeError(
-                        f"private Lance take_scan range [{start}, {stop}) returned "
-                        f"{batch.num_rows} rows"
+                        f"fragment {fragment_index} scan returned an empty batch"
                     )
-                range_ids = list(range(start, stop))
-                mask = pa.array(
-                    [row_id in requested for row_id in range_ids],
-                    type=pa.bool_(),
+                batch_start = fragment_start + scanned_rows
+                batch_stop = batch_start + batch.num_rows
+                if batch_stop > fragment_start + fragment_rows:
+                    raise RuntimeError(
+                        f"fragment {fragment_index} scan exceeded its manifest row count"
+                    )
+                requested_start = bisect_left(operation.row_ids, batch_start)
+                requested_stop = bisect_left(operation.row_ids, batch_stop)
+                requested = operation.row_ids[requested_start:requested_stop]
+                if requested:
+                    filtered_tables.append(
+                        pa.Table.from_batches([batch]).take(
+                            pa.array(
+                                [row_id - batch_start for row_id in requested],
+                                type=pa.int64(),
+                            )
+                        )
+                    )
+                    filtered_row_ids.extend(requested)
+                scanned_rows += batch.num_rows
+                scan_batches += 1
+            if scanned_rows != fragment_rows:
+                raise RuntimeError(
+                    f"fragment {fragment_index} scan returned {scanned_rows} physical "
+                    f"rows; expected {fragment_rows}"
                 )
-                filtered_tables.append(pa.Table.from_batches([batch]).filter(mask))
-                filtered_row_ids.extend(
-                    row_id for row_id in range_ids if row_id in requested
+            returned_row_ids = tuple(filtered_row_ids)
+            if returned_row_ids != operation.row_ids:
+                raise RuntimeError(
+                    f"fragment {fragment_index} scan changed stable row-ID "
+                    "order or coverage"
                 )
             table = (
                 pa.concat_tables(filtered_tables)
                 if len(filtered_tables) > 1
                 else filtered_tables[0]
             )
-            if table.num_rows != len(operation.row_ids):
-                raise RuntimeError(
-                    f"private Lance take_scan returned {table.num_rows} requested "
-                    f"rows for {len(operation.row_ids)} stable row IDs"
-                )
-            return _PayloadReadBatch(table, tuple(filtered_row_ids))
+            return _PayloadReadBatch(
+                table,
+                returned_row_ids,
+                fragment_scan_calls=1,
+                fragment_scan_batches=scan_batches,
+            )
 
         pending: dict[Future[_PayloadReadBatch], int] = {}
         completed: dict[int, _PayloadReadBatch] = {}
@@ -1012,21 +1142,36 @@ class GpuLanceColumnFetcher:
             execution_seconds = time.perf_counter() - execution_started
 
         batches = tuple(completed[index] for index in range(len(completed)))
-        take_calls = len(plan.operations) if projected else 0
+        returned_row_ids = tuple(
+            row_id for batch in batches for row_id in batch.row_ids
+        )
+        expected_row_ids = plan.row_ids if projected else ()
+        if returned_row_ids != expected_row_ids:
+            raise RuntimeError(
+                "private Lance reads changed stable row-ID order or coverage"
+            )
         take_rows_calls = (
             sum(operation.strategy == "take_rows" for operation in plan.operations)
             if projected
             else 0
         )
+        fragment_take_calls = sum(batch.fragment_take_calls for batch in batches)
+        fragment_scan_calls = sum(batch.fragment_scan_calls for batch in batches)
+        fragment_scan_batches = sum(batch.fragment_scan_batches for batch in batches)
+        read_calls = take_rows_calls + fragment_take_calls + fragment_scan_calls
         return _PayloadReadResult(
             batches=batches,
             metrics={
-                "payload_take_calls": take_calls,
+                "payload_take_calls": read_calls,
+                "payload_read_calls": read_calls,
                 "payload_take_rows": len(plan.row_ids),
                 "payload_read_planning_seconds": planning_seconds,
                 "payload_read_execution_seconds": execution_seconds,
                 "rows_per_payload_take": (
-                    len(plan.row_ids) / take_calls if take_calls else 0.0
+                    len(plan.row_ids) / read_calls if read_calls else 0.0
+                ),
+                "rows_per_payload_read": (
+                    len(plan.row_ids) / read_calls if read_calls else 0.0
                 ),
                 "max_pending_payload_reads": peak_pending,
                 "coordinate_density": plan.coordinate_density,
@@ -1034,9 +1179,21 @@ class GpuLanceColumnFetcher:
                 "strategy_range_fragments": plan.range_fragments,
                 "strategy_sequential_fragments": plan.sequential_fragments,
                 "take_rows_calls": take_rows_calls,
-                "take_scan_calls": take_calls - take_rows_calls,
-                "take_scan_ranges": plan.take_scan_ranges if projected else 0,
-                "planned_scan_rows": plan.planned_scan_rows if projected else 0,
+                "fragment_take_calls": fragment_take_calls,
+                "fragment_scan_calls": fragment_scan_calls,
+                "fragment_scan_batches": fragment_scan_batches,
+                "fragment_take_ranges": (plan.fragment_take_ranges if projected else 0),
+                "planned_fragment_read_rows": (
+                    plan.planned_fragment_read_rows if projected else 0
+                ),
+                # Deprecated schema aliases. Fragment-local reads no longer call
+                # Dataset.take_scan, but existing benchmark gates require these
+                # fields to prove that sparse mode stayed on the sparse path.
+                "take_scan_calls": 0,
+                "take_scan_ranges": 0,
+                "planned_scan_rows": (
+                    plan.planned_fragment_read_rows if projected else 0
+                ),
                 "range_overread_rows": (plan.range_overread_rows if projected else 0),
             },
         )
@@ -1258,7 +1415,7 @@ class GpuLanceColumnFetcher:
             metrics["index_loaded_this_batch"] = False
         self.last_metrics = metrics
         for name, value in metrics.items():
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if isinstance(value, bool) or not isinstance(value, int | float):
                 continue
             self.cumulative_metrics[name] = self.cumulative_metrics.get(name, 0) + value
 

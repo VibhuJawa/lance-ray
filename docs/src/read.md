@@ -105,8 +105,12 @@ explicit validation run; it adds the dataset key to timed payload I/O.
 The measured remote default is `payload_read_mode="sparse"` with 1,024 IDs per
 private take and at most 16 pending reads. An opt-in
 `payload_read_mode="adaptive_unmeasured"` planner groups global ordinals by
-fragment and selects sparse `_take_rows`, coalesced private `_ds.take_scan`
-ranges, or a projected full-fragment scan from configured density thresholds.
-The adaptive name is intentional: it carries strategy, range-overread, IOPS,
-read-size, and amplification telemetry, but it is not the default until a
-matched remote benchmark demonstrates a win.
+fragment while preserving global `fetch_batch_size` packing across consecutive
+low-density fragments. Medium-density fragments reuse one projected fragment
+session and split coalesced local-offset ranges into bounded `take` calls.
+High-density fragments stream projected `fragment.to_batches` output with the
+configured batch size and readahead; exact stable-ID order, requested-row
+coverage, and full physical fragment coverage fail closed. The adaptive name
+is intentional: it reports sparse takes, fragment takes, streamed scan calls
+and batches, range overread, IOPS, read size, and amplification, but it is not
+the default until a matched remote benchmark demonstrates a win.
