@@ -405,13 +405,18 @@ class LanceDatasource(Datasource):
             if len(fragments) == 0:
                 continue
 
-            # Use scanner.count_rows with filter to count rows meeting specified conditions
-            scanner_options = self._scanner_options.copy()
-            scanner_options["fragments"] = fragments
-            scanner_options["columns"] = []
-            scanner_options["with_row_id"] = True
-            scanner = self._lance_ds.scanner(**scanner_options)
-            num_rows = scanner.count_rows()
+            # A filtered count executes the remote predicate once on the driver
+            # before the worker executes the same read. Ray accepts an unknown
+            # initial row count, so defer filtered work to the read task itself.
+            if self._scanner_options.get("filter") is not None:
+                num_rows = None
+            else:
+                scanner_options = self._scanner_options.copy()
+                scanner_options["fragments"] = fragments
+                scanner_options["columns"] = []
+                scanner_options["with_row_id"] = True
+                scanner = self._lance_ds.scanner(**scanner_options)
+                num_rows = scanner.count_rows()
 
             fragment_ids = [f.metadata.id for f in fragments]
             input_files = [

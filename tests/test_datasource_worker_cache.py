@@ -315,6 +315,55 @@ def test_read_task_carries_cache_configuration_into_worker_reconstruction(
 
 
 @pytest.mark.parametrize(
+    ("filter_expression", "expected_rows", "expected_count_calls"),
+    [(None, 7, 1), ("url = 'needle'", None, 0)],
+)
+def test_filtered_read_task_defers_row_count_to_worker(
+    filter_expression,
+    expected_rows,
+    expected_count_calls,
+):
+    count_calls = []
+
+    class Scanner:
+        def count_rows(self):
+            count_calls.append(True)
+            return 7
+
+    class NativeDataset:
+        uri = "memory://images"
+        version = 4
+        initial_storage_options = None
+        _ds = type(
+            "NativeHandle",
+            (),
+            {"serialized_manifest": lambda self: b"manifest"},
+        )()
+
+        def scanner(self, **kwargs):
+            return Scanner()
+
+    class Fragment:
+        metadata = type("Metadata", (), {"id": 7})()
+        schema = pa.schema([pa.field("url", pa.string())])
+
+        def data_files(self):
+            return []
+
+    datasource = LanceDatasource(
+        "memory://images",
+        filter=filter_expression,
+    )
+    datasource._lance_ds = NativeDataset()
+    datasource._fragments = [Fragment()]
+
+    task = datasource.get_read_tasks(parallelism=1)[0]
+
+    assert task.metadata.num_rows == expected_rows
+    assert len(count_calls) == expected_count_calls
+
+
+@pytest.mark.parametrize(
     ("kwargs", "error"),
     [
         ({"index_cache_size_bytes": -1}, ValueError),
