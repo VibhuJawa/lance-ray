@@ -16,6 +16,7 @@ from bisect import bisect_left, bisect_right
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import fsspec
@@ -284,6 +285,77 @@ class GpuLanceFetchConfig:
 
 
 @dataclass(frozen=True)
+class LanceStableIdPayloadConfig:
+    """Pinned Lance payload-read settings without GPU index ownership."""
+
+    dataset_uri: str
+    dataset_version: int
+    expected_rows: int
+    columns: dict[str, str]
+    dataset_storage_options: dict[str, str] = field(default_factory=dict, repr=False)
+    fetch_batch_size: int = 4096
+    io_threads: int = 16
+    max_pending_fetch_batches: int = 16
+    index_cache_size_bytes: Optional[int] = None
+    metadata_cache_size_bytes: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        try:
+            columns = dict(self.columns)
+            storage_options = dict(self.dataset_storage_options)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "columns and dataset_storage_options must be mappings"
+            ) from exc
+        object.__setattr__(self, "columns", columns)
+        object.__setattr__(self, "dataset_storage_options", storage_options)
+        if not isinstance(self.dataset_uri, str):
+            raise TypeError("dataset_uri must be a string")
+        if not self.dataset_uri:
+            raise ValueError("dataset_uri must not be empty")
+        for name in (
+            "dataset_version",
+            "expected_rows",
+            "fetch_batch_size",
+            "io_threads",
+            "max_pending_fetch_batches",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an integer")
+            if value <= 0:
+                raise ValueError(f"{name} must be greater than zero")
+        if not self.columns:
+            raise ValueError("columns must not be empty")
+        if any(
+            not isinstance(source, str) or not isinstance(destination, str)
+            for source, destination in self.columns.items()
+        ):
+            raise TypeError("source and destination column names must be strings")
+        if any(
+            not source or not destination
+            for source, destination in self.columns.items()
+        ):
+            raise ValueError("source and destination column names must not be empty")
+        destinations = list(self.columns.values())
+        if len(set(destinations)) != len(destinations):
+            raise ValueError("destination column names must be unique")
+        if any(
+            not isinstance(key, str) or not isinstance(value, str)
+            for key, value in self.dataset_storage_options.items()
+        ):
+            raise TypeError("dataset_storage_options keys and values must be strings")
+        for name in ("index_cache_size_bytes", "metadata_cache_size_bytes"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or (
+                value is not None and not isinstance(value, int)
+            ):
+                raise TypeError(f"{name} must be an integer or None")
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be nonnegative or None")
+
+
+@dataclass(frozen=True)
 class _GpuMapResult:
     matched: list[bool]
     row_ids: list[int]
@@ -331,9 +403,126 @@ class _PayloadReadBatch:
 
 
 @dataclass(frozen=True)
+class _TimedPayloadReadBatch:
+    batch: _PayloadReadBatch
+    started: float
+    finished: float
+
+
+@dataclass(frozen=True)
 class _PayloadReadResult:
     batches: tuple[_PayloadReadBatch, ...]
     metrics: dict[str, int | float]
+
+
+def _read_interval_metrics(
+    intervals: Sequence[tuple[float, float]],
+) -> tuple[float, float, float]:
+    """Return call-sum, active-union, and first-start/last-finish envelope."""
+    if not intervals:
+        return 0.0, 0.0, 0.0
+    ordered = sorted(intervals)
+    call_sum = sum(finished - started for started, finished in ordered)
+    union = 0.0
+    union_start, union_stop = ordered[0]
+    for started, finished in ordered[1:]:
+        if started <= union_stop:
+            union_stop = max(union_stop, finished)
+        else:
+            union += union_stop - union_start
+            union_start, union_stop = started, finished
+    union += union_stop - union_start
+    envelope = max(finished for _, finished in ordered) - min(
+        started for started, _ in ordered
+    )
+    return call_sum, union, envelope
+
+
+def _validate_pinned_lance_dataset(
+    dataset: Any,
+    *,
+    dataset_version: int,
+    expected_rows: int,
+    required_columns: set[str],
+    contract_name: str,
+    expected_rows_name: str,
+) -> tuple[_StableGlobalOrdinalManifest, tuple[Any, ...]]:
+    if dataset.version != dataset_version:
+        raise ValueError(
+            f"opened Lance version {dataset.version}; expected {dataset_version}"
+        )
+    if not dataset.has_stable_row_ids:
+        raise ValueError(f"{contract_name} requires Lance stable row IDs")
+    fragments = list(dataset.get_fragments())
+    if not fragments:
+        raise ValueError(f"{contract_name} requires at least one Lance fragment")
+    physical_rows = 0
+    fragment_starts = []
+    fragment_row_counts = []
+    for position, fragment in enumerate(fragments):
+        fragment_id = int(fragment.fragment_id)
+        if fragment_id != position:
+            raise ValueError(
+                f"{contract_name} requires contiguous manifest-order fragment IDs; "
+                f"position {position} has fragment ID {fragment_id}"
+            )
+        fragment_rows = int(fragment.physical_rows)
+        if fragment_rows <= 0 or fragment_rows > 2**32:
+            raise ValueError(
+                f"fragment {fragment_id} has invalid physical row count {fragment_rows}"
+            )
+        if int(fragment.metadata.physical_rows) != fragment_rows:
+            raise ValueError(
+                f"fragment {fragment_id} physical-row metadata is inconsistent"
+            )
+        if (
+            int(fragment.num_deletions) != 0
+            or fragment.deletion_file() is not None
+            or fragment.metadata.deletion_file is not None
+        ):
+            raise ValueError(
+                f"{contract_name} requires an append-only Lance snapshot without "
+                f"deletions; fragment {fragment_id} contains deletions"
+            )
+        fragment_starts.append(physical_rows)
+        fragment_row_counts.append(fragment_rows)
+        physical_rows += fragment_rows
+    dataset_rows = int(dataset.count_rows())
+    if physical_rows != dataset_rows:
+        raise ValueError(
+            f"{contract_name} requires complete physical-row coverage; manifest has "
+            f"{physical_rows} rows but dataset reports {dataset_rows}"
+        )
+    if expected_rows != dataset_rows:
+        raise ValueError(
+            f"{expected_rows_name} and Lance row counts differ: "
+            f"expected_rows={expected_rows}, dataset_rows={dataset_rows}"
+        )
+    missing = sorted(required_columns - set(dataset.schema.names))
+    if missing:
+        raise ValueError(f"requested Lance columns do not exist: {missing}")
+    return (
+        _StableGlobalOrdinalManifest(
+            fragment_starts=tuple(fragment_starts),
+            fragment_rows=tuple(fragment_row_counts),
+            total_rows=dataset_rows,
+        ),
+        tuple(fragments),
+    )
+
+
+def _read_sparse_payload_operation(
+    dataset: Any,
+    operation: _PrivateReadOperation,
+    projected: list[str],
+) -> _PayloadReadBatch:
+    table = dataset._take_rows(list(operation.row_ids), columns=projected)
+    if table.num_rows != len(operation.row_ids):
+        raise RuntimeError(
+            f"private Lance take returned {table.num_rows} rows for "
+            f"{len(operation.row_ids)} stable row IDs"
+        )
+    return _PayloadReadBatch(table, operation.row_ids)
 
 
 class _GpuExactKeyIndex:
@@ -802,70 +991,16 @@ class GpuLanceColumnFetcher:
 
     def _validate_dataset(self) -> None:
         config = self.config
-        if self._dataset.version != config.dataset_version:
-            raise ValueError(
-                f"opened Lance version {self._dataset.version}; "
-                f"expected {config.dataset_version}"
-            )
-        if not self._dataset.has_stable_row_ids:
-            raise ValueError("GPU column fetch requires Lance stable row IDs")
-        fragments = list(self._dataset.get_fragments())
-        if not fragments:
-            raise ValueError("GPU column fetch requires at least one Lance fragment")
-        physical_rows = 0
-        fragment_starts = []
-        fragment_row_counts = []
-        for position, fragment in enumerate(fragments):
-            fragment_id = int(fragment.fragment_id)
-            if fragment_id != position:
-                raise ValueError(
-                    "GPU column fetch requires contiguous manifest-order fragment IDs; "
-                    f"position {position} has fragment ID {fragment_id}"
-                )
-            fragment_rows = int(fragment.physical_rows)
-            if fragment_rows <= 0 or fragment_rows > 2**32:
-                raise ValueError(
-                    f"fragment {fragment_id} has invalid physical row count {fragment_rows}"
-                )
-            if int(fragment.metadata.physical_rows) != fragment_rows:
-                raise ValueError(
-                    f"fragment {fragment_id} physical-row metadata is inconsistent"
-                )
-            if (
-                int(fragment.num_deletions) != 0
-                or fragment.deletion_file() is not None
-                or fragment.metadata.deletion_file is not None
-            ):
-                raise ValueError(
-                    "GPU column fetch requires an append-only Lance snapshot without deletions; "
-                    f"fragment {fragment_id} contains deletions"
-                )
-            fragment_starts.append(physical_rows)
-            fragment_row_counts.append(fragment_rows)
-            physical_rows += fragment_rows
-        dataset_rows = int(self._dataset.count_rows())
-        if physical_rows != dataset_rows:
-            raise ValueError(
-                "GPU column fetch requires complete physical-row coverage; "
-                f"manifest has {physical_rows} rows but dataset reports {dataset_rows}"
-            )
-        if self.config.expected_reference_rows != dataset_rows:
-            raise ValueError(
-                "sidecar and Lance row counts differ: "
-                f"expected_reference_rows={self.config.expected_reference_rows}, "
-                f"dataset_rows={dataset_rows}"
-            )
-        self._manifest = _StableGlobalOrdinalManifest(
-            fragment_starts=tuple(fragment_starts),
-            fragment_rows=tuple(fragment_row_counts),
-            total_rows=dataset_rows,
-        )
-        self._fragments = tuple(fragments)
-        self._dataset_rows = dataset_rows
         required = {config.dataset_key_column, *config.columns}
-        missing = sorted(required - set(self._dataset.schema.names))
-        if missing:
-            raise ValueError(f"requested Lance columns do not exist: {missing}")
+        self._manifest, self._fragments = _validate_pinned_lance_dataset(
+            self._dataset,
+            dataset_version=config.dataset_version,
+            expected_rows=config.expected_reference_rows,
+            required_columns=required,
+            contract_name="GPU column fetch",
+            expected_rows_name="sidecar",
+        )
+        self._dataset_rows = self._manifest.total_rows
 
     def _validate_key_types(self) -> None:
         dataset_type = self._dataset.schema.field(self.config.dataset_key_column).type
@@ -963,16 +1098,7 @@ class GpuLanceColumnFetcher:
         projected: list[str],
     ) -> _PayloadReadBatch:
         if operation.strategy == "take_rows":
-            table = self._dataset._take_rows(
-                list(operation.row_ids),
-                columns=projected,
-            )
-            if table.num_rows != len(operation.row_ids):
-                raise RuntimeError(
-                    f"private Lance take returned {table.num_rows} rows for "
-                    f"{len(operation.row_ids)} stable row IDs"
-                )
-            return _PayloadReadBatch(table, operation.row_ids)
+            return _read_sparse_payload_operation(self._dataset, operation, projected)
 
         if operation.fragment_index is None:
             raise RuntimeError(
@@ -1433,6 +1559,342 @@ class GpuLanceColumnFetcher:
         return output
 
 
+class LanceStableIdPayloadStreamer:
+    """Sidecar-free, in-process payload reads for resolved stable ordinals.
+
+    Coordinate resolution, sorting, deduplication, and origin fan-out stay with
+    the caller. The input must therefore be a non-null, strictly increasing
+    ``uint64`` Arrow array (or a table containing one). The iterator yields one
+    row per stable ordinal in deterministic order and never loads cuDF or a GPU
+    sidecar.
+
+    Internally retained ready/running payload tables are capped by
+    ``max_pending_fetch_batches`` and every table has at most
+    ``fetch_batch_size`` rows. This is not a byte bound because a single payload
+    value can be arbitrarily large. ``last_metrics`` is replaced only after the
+    iterator is completely exhausted; partial consumption publishes no final
+    metrics.
+    """
+
+    def __init__(
+        self,
+        config: LanceStableIdPayloadConfig,
+        *,
+        dataset: Any = None,
+        session: Any = None,
+        stable_row_id_output_column: str = "stable_row_id",
+    ) -> None:
+        import lance
+
+        if not isinstance(stable_row_id_output_column, str):
+            raise TypeError("stable_row_id_output_column must be a string")
+        if not stable_row_id_output_column:
+            raise ValueError("stable_row_id_output_column must not be empty")
+        self._columns = tuple(config.columns.items())
+        if stable_row_id_output_column in {
+            destination for _, destination in self._columns
+        }:
+            raise ValueError(
+                "stable_row_id_output_column must not collide with payload destinations"
+            )
+        if dataset is not None and session is not None:
+            raise ValueError("set either dataset or session, not both")
+        self.config = config
+        self.stable_row_id_output_column = stable_row_id_output_column
+        self._closed = False
+        self._iterator_lock = Lock()
+        self.last_metrics: dict[str, int | float | bool] = {}
+        self.cumulative_metrics: dict[str, int | float] = {}
+        if dataset is None:
+            self._session = session or lance.Session(
+                index_cache_size_bytes=config.index_cache_size_bytes,
+                metadata_cache_size_bytes=config.metadata_cache_size_bytes,
+            )
+            self._dataset = lance.dataset(
+                config.dataset_uri,
+                version=config.dataset_version,
+                storage_options=config.dataset_storage_options or None,
+                session=self._session,
+            )
+        else:
+            if str(dataset.uri) != config.dataset_uri:
+                raise ValueError(
+                    f"opened Lance URI {dataset.uri!s}; expected {config.dataset_uri}"
+                )
+            self._session = None
+            self._dataset = dataset
+        self._manifest, self._fragments = _validate_pinned_lance_dataset(
+            self._dataset,
+            dataset_version=config.dataset_version,
+            expected_rows=config.expected_rows,
+            required_columns={source for source, _ in self._columns},
+            contract_name="stable-ID payload streaming",
+            expected_rows_name="coordinate manifest",
+        )
+        output_fields = [
+            pa.field(self.stable_row_id_output_column, pa.uint64(), nullable=False)
+        ]
+        for source, destination in self._columns:
+            source_field = self._dataset.schema.field(source)
+            output_fields.append(
+                pa.field(
+                    destination,
+                    source_field.type,
+                    nullable=source_field.nullable,
+                    metadata=source_field.metadata,
+                )
+            )
+        self._output_schema = pa.schema(output_fields)
+        self._executor = ThreadPoolExecutor(
+            max_workers=config.io_threads,
+            thread_name_prefix="lance-ray-stable-id-fetch",
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._dataset = None
+        self._session = None
+
+    def __del__(self) -> None:  # pragma: no cover - interpreter teardown
+        with suppress(Exception):
+            self.close()
+
+    def _normalize_stable_ids(
+        self,
+        values: pa.Array | pa.ChunkedArray | pa.Table,
+        stable_row_id_column: str,
+    ) -> list[int]:
+        if not isinstance(stable_row_id_column, str):
+            raise TypeError("stable_row_id_column must be a string")
+        if not stable_row_id_column:
+            raise ValueError("stable_row_id_column must not be empty")
+        if isinstance(values, pa.Table):
+            if stable_row_id_column not in values.column_names:
+                raise ValueError(
+                    f"stable row-ID column {stable_row_id_column!r} does not exist"
+                )
+            array = values[stable_row_id_column].combine_chunks()
+        elif isinstance(values, pa.ChunkedArray):
+            array = values.combine_chunks()
+        elif isinstance(values, pa.Array):
+            array = values
+        else:
+            raise TypeError(
+                "stable IDs must be a pyarrow.Array, ChunkedArray, or Table"
+            )
+        if array.type != pa.uint64():
+            raise TypeError(f"stable IDs have type {array.type}; expected uint64")
+        if array.null_count:
+            raise ValueError("stable IDs must not contain nulls")
+        row_ids = array.to_pylist()
+        for previous, current in zip(row_ids, row_ids[1:], strict=False):
+            if current <= previous:
+                raise ValueError(
+                    "stable IDs must be strictly increasing and duplicate-free"
+                )
+        return row_ids
+
+    def _read_operation(
+        self,
+        operation: _PrivateReadOperation,
+        projected: list[str],
+    ) -> _TimedPayloadReadBatch:
+        started = time.perf_counter()
+        batch = _read_sparse_payload_operation(self._dataset, operation, projected)
+        finished = time.perf_counter()
+        return _TimedPayloadReadBatch(batch, started, finished)
+
+    def _iter_payload_batches(
+        self,
+        row_ids: list[int],
+        state: dict[str, int | float | bool],
+    ) -> Iterator[_PayloadReadBatch]:
+        planning_started = time.perf_counter()
+        plan = _plan_locality_reads(
+            row_ids,
+            manifest=self._manifest,
+            fetch_batch_size=self.config.fetch_batch_size,
+            payload_read_mode="sparse",
+            medium_density_threshold=0.25,
+            high_density_threshold=0.75,
+            max_coalesced_range_gap=0,
+        )
+        planning_seconds = time.perf_counter() - planning_started
+        operations = plan.operations
+        state.update(
+            {
+                "payload_take_calls": 0,
+                "payload_read_calls": 0,
+                "payload_take_rows": len(plan.row_ids),
+                "payload_read_planning_seconds": planning_seconds,
+                "payload_read_execution_seconds": 0.0,
+                "payload_read_call_sum_seconds": 0.0,
+                "payload_read_active_union_seconds": 0.0,
+                "payload_read_envelope_seconds": 0.0,
+                "payload_read_scheduler_wall_seconds": 0.0,
+                "payload_batches_planned": len(operations),
+                "payload_batches_emitted": 0,
+                "max_pending_payload_reads": 0,
+                "max_retained_payload_batches": 0,
+                "payload_batch_row_limit": self.config.fetch_batch_size,
+                "payload_byte_bound": False,
+                "coordinate_density": plan.coordinate_density,
+                "strategy_sparse_fragments": plan.sparse_fragments,
+                "take_rows_calls": 0,
+                "stream_complete": not operations,
+            }
+        )
+        if not operations:
+            return
+
+        pending: dict[int, Future[_TimedPayloadReadBatch]] = {}
+        next_operation = 0
+        read_intervals: list[tuple[float, float]] = []
+
+        def fill_window() -> None:
+            nonlocal next_operation
+            while (
+                next_operation < len(operations)
+                and len(pending) < self.config.max_pending_fetch_batches
+            ):
+                pending[next_operation] = self._executor.submit(
+                    self._read_operation,
+                    operations[next_operation],
+                    [source for source, _ in self._columns],
+                )
+                next_operation += 1
+            state["max_pending_payload_reads"] = max(
+                int(state["max_pending_payload_reads"]), len(pending)
+            )
+
+        execution_started = time.perf_counter()
+        fill_window()
+        try:
+            for operation_index, operation in enumerate(operations):
+                future = pending.pop(operation_index)
+                timed_batch = future.result()
+                batch = timed_batch.batch
+                read_intervals.append((timed_batch.started, timed_batch.finished))
+                if batch.row_ids != operation.row_ids:
+                    raise RuntimeError(
+                        "streaming Lance read changed stable row-ID order or coverage"
+                    )
+                state["max_retained_payload_batches"] = max(
+                    int(state["max_retained_payload_batches"]), len(pending) + 1
+                )
+                state["payload_take_calls"] = int(state["payload_take_calls"]) + 1
+                state["payload_read_calls"] = int(state["payload_read_calls"]) + 1
+                state["take_rows_calls"] = int(state["take_rows_calls"]) + 1
+                state["payload_batches_emitted"] = operation_index + 1
+                call_sum, active_union, envelope = _read_interval_metrics(
+                    read_intervals
+                )
+                state["payload_read_call_sum_seconds"] = call_sum
+                state["payload_read_active_union_seconds"] = active_union
+                state["payload_read_envelope_seconds"] = envelope
+                # Backward-compatible name, now explicitly a read-only denominator.
+                state["payload_read_execution_seconds"] = active_union
+                state["payload_read_scheduler_wall_seconds"] = (
+                    time.perf_counter() - execution_started
+                )
+                state["stream_complete"] = operation_index + 1 == len(operations)
+                yield batch
+                del batch
+                fill_window()
+        finally:
+            unfinished = tuple(pending.values())
+            for future in unfinished:
+                future.cancel()
+            if unfinished:
+                wait(unfinished)
+
+    def _iter_stable_row_ids_unlocked(
+        self,
+        values: pa.Array | pa.ChunkedArray | pa.Table,
+        *,
+        stable_row_id_column: str = "stable_row_id",
+    ) -> Iterator[pa.Table]:
+        row_ids = self._normalize_stable_ids(values, stable_row_id_column)
+        self._dataset.io_stats_incremental()
+        started = time.perf_counter()
+        state: dict[str, int | float | bool] = {}
+        payload_bytes = 0
+        output_rows = 0
+        batches = self._iter_payload_batches(row_ids, state)
+        try:
+            for batch in batches:
+                arrays: list[pa.Array | pa.ChunkedArray] = [
+                    pa.array(batch.row_ids, type=pa.uint64())
+                ]
+                for source, _ in self._columns:
+                    arrays.append(batch.table[source])
+                    payload_bytes += batch.table[source].nbytes
+                output = pa.Table.from_arrays(arrays, schema=self._output_schema)
+                output_rows += output.num_rows
+                yield output
+        finally:
+            batches.close()
+
+        io_stats = self._dataset.io_stats_incremental()
+        execution_seconds = float(state["payload_read_execution_seconds"])
+        read_calls = int(state["payload_read_calls"])
+        metrics: dict[str, int | float | bool] = {
+            **state,
+            "input_stable_rows": len(row_ids),
+            "stream_output_rows": output_rows,
+            "payload_bytes": payload_bytes,
+            "payload_stream_wall_seconds": time.perf_counter() - started,
+            "sparse_calls_without_coalescing": len(row_ids),
+            "sparse_calls_avoided": max(len(row_ids) - read_calls, 0),
+            "lance_read_iops": int(io_stats.read_iops),
+            "lance_read_bytes": int(io_stats.read_bytes),
+            "physical_read_operations_per_second": (
+                float(io_stats.read_iops) / execution_seconds
+                if execution_seconds
+                else 0.0
+            ),
+            "average_physical_read_bytes": (
+                float(io_stats.read_bytes) / io_stats.read_iops
+                if io_stats.read_iops
+                else 0.0
+            ),
+            "physical_reads_per_unique_payload": (
+                float(io_stats.read_iops) / len(row_ids) if row_ids else 0.0
+            ),
+            "read_amplification": (
+                float(io_stats.read_bytes) / payload_bytes if payload_bytes else 0.0
+            ),
+        }
+        self.last_metrics = metrics
+        for name, value in metrics.items():
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                continue
+            self.cumulative_metrics[name] = self.cumulative_metrics.get(name, 0) + value
+
+    def iter_stable_row_ids(
+        self,
+        values: pa.Array | pa.ChunkedArray | pa.Table,
+        *,
+        stable_row_id_column: str = "stable_row_id",
+    ) -> Iterator[pa.Table]:
+        """Yield projected payloads for pre-sorted unique stable ordinals."""
+        if self._closed:
+            raise RuntimeError("LanceStableIdPayloadStreamer is closed")
+        if not self._iterator_lock.acquire(blocking=False):
+            raise RuntimeError("only one stable-ID payload iterator may be active")
+        try:
+            self.last_metrics = {}
+            yield from self._iter_stable_row_ids_unlocked(
+                values,
+                stable_row_id_column=stable_row_id_column,
+            )
+        finally:
+            self._iterator_lock.release()
+
+
 class GpuLanceUniquePayloadStreamer(GpuLanceColumnFetcher):
     """Stream one payload row per unique key in stable-row-ID order.
 
@@ -1608,8 +2070,11 @@ class GpuLanceUniquePayloadStreamer(GpuLanceColumnFetcher):
                 del batch
                 fill_window()
         finally:
-            for future in pending.values():
+            unfinished = tuple(pending.values())
+            for future in unfinished:
                 future.cancel()
+            if unfinished:
+                wait(unfinished)
 
     def _stream_output_table(
         self,
@@ -1948,6 +2413,8 @@ __all__ = [
     "GpuLanceColumnFetcher",
     "GpuLanceFetchConfig",
     "GpuLanceUniquePayloadStreamer",
+    "LanceStableIdPayloadConfig",
+    "LanceStableIdPayloadStreamer",
     "fetch_lance_columns_on_gpu",
     "get_gpu_fetch_metrics",
     "stream_unique_lance_columns_on_gpu",

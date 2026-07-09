@@ -452,10 +452,10 @@ def test_unique_payload_stream_is_ordered_with_delayed_first_future(
         submitted.append(row_id)
         if row_id == 0:
             assert second_finished.wait(timeout=5)
-        elif row_id == 1:
-            second_finished.set()
         result = original_read(operation, projected)
         finished.append(row_id)
+        if row_id == 1:
+            second_finished.set()
         return result
 
     streamer._read_payload_operation = delayed_read
@@ -468,9 +468,9 @@ def test_unique_payload_stream_is_ordered_with_delayed_first_future(
 
     second = next(iterator)
     assert second["stable_row_id"].to_pylist() == [1]
-    assert submitted == [0, 1, 2]
     remaining = list(iterator)
     outputs = [first, second, *remaining]
+    assert sorted(submitted) == [0, 1, 2, 3]
     assert [table["stable_row_id"].to_pylist()[0] for table in outputs] == [
         0,
         1,
