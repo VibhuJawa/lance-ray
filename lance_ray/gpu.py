@@ -16,7 +16,8 @@ from bisect import bisect_left, bisect_right
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from dataclasses import dataclass, field
-from threading import Lock
+from queue import Full, Queue
+from threading import Condition, Event, Lock, Thread
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import fsspec
@@ -286,7 +287,14 @@ class GpuLanceFetchConfig:
 
 @dataclass(frozen=True)
 class LanceStableIdPayloadConfig:
-    """Pinned Lance payload-read settings without GPU index ownership."""
+    """Pinned Lance payload-read settings without GPU index ownership.
+
+    ``max_pending_fetch_batches`` independently caps the in-flight read window
+    and the completion-ready queue. The producer retains at most twice that many
+    row-bounded payload batches; the generator can additionally expose one
+    current batch, for an internal bound of ``2 * limit + 1``. Caller-retained
+    outputs are outside this bound. This is not a payload-byte bound.
+    """
 
     dataset_uri: str
     dataset_version: int
@@ -410,6 +418,24 @@ class _TimedPayloadReadBatch:
 
 
 @dataclass(frozen=True)
+class _CompletedPayloadRead:
+    operation_index: int
+    timed_batch: _TimedPayloadReadBatch
+
+
+@dataclass(frozen=True)
+class _PayloadProducerSummary:
+    completion_indices: tuple[int, ...]
+    read_intervals: tuple[tuple[float, float], ...]
+    scheduler_seconds: float
+
+
+@dataclass(frozen=True)
+class _PayloadProducerError:
+    error: BaseException
+
+
+@dataclass(frozen=True)
 class _PayloadReadResult:
     batches: tuple[_PayloadReadBatch, ...]
     metrics: dict[str, int | float]
@@ -436,6 +462,21 @@ def _read_interval_metrics(
         started for started, _ in ordered
     )
     return call_sum, union, envelope
+
+
+def _peak_read_concurrency(intervals: Sequence[tuple[float, float]]) -> int:
+    events = [
+        event
+        for started, finished in intervals
+        for event in ((started, 1), (finished, -1))
+    ]
+    running = 0
+    peak = 0
+    # Finish events sort before starts at the same timestamp.
+    for _, delta in sorted(events, key=lambda event: (event[0], event[1])):
+        running += delta
+        peak = max(peak, running)
+    return peak
 
 
 def _validate_pinned_lance_dataset(
@@ -1564,16 +1605,19 @@ class LanceStableIdPayloadStreamer:
 
     Coordinate resolution, sorting, deduplication, and origin fan-out stay with
     the caller. The input must therefore be a non-null, strictly increasing
-    ``uint64`` Arrow array (or a table containing one). The iterator yields one
-    row per stable ordinal in deterministic order and never loads cuDF or a GPU
-    sidecar.
+    ``uint64`` Arrow array (or a table containing one). Read operations are
+    emitted in completion order to avoid head-of-line blocking. Stable IDs stay
+    sorted within every batch, but global output order is intentionally not
+    guaranteed; full exhaustion validates exact operation coverage. The reader
+    never loads cuDF or a GPU sidecar.
 
-    Internally retained ready/running payload tables are capped by
-    ``max_pending_fetch_batches`` and every table has at most
-    ``fetch_batch_size`` rows. This is not a byte bound because a single payload
-    value can be arbitrarily large. ``last_metrics`` is replaced only after the
-    iterator is completely exhausted; partial consumption publishes no final
-    metrics.
+    Running reads and completion-ready payload tables are independently capped
+    by ``max_pending_fetch_batches``. Including the one batch currently exposed
+    by the generator, internal retention is bounded by ``2 * limit + 1``;
+    caller-retained outputs are outside that contract. This is not a byte bound
+    because one payload can be arbitrarily large. ``last_metrics`` is replaced
+    only after complete iterator exhaustion; partial consumption publishes no
+    final metrics.
     """
 
     def __init__(
@@ -1739,77 +1783,264 @@ class LanceStableIdPayloadStreamer:
                 "payload_batches_emitted": 0,
                 "max_pending_payload_reads": 0,
                 "max_retained_payload_batches": 0,
+                "peak_in_flight_payload_reads": 0,
+                "peak_running_payload_reads": 0,
+                "peak_ready_payload_batches": 0,
+                "peak_producer_retained_payload_batches": 0,
+                "peak_total_retained_payload_batches": 0,
+                "retained_payload_batch_upper_bound": (
+                    2 * self.config.max_pending_fetch_batches + 1
+                ),
+                "consumer_held_payload_batch_limit": 1,
                 "payload_batch_row_limit": self.config.fetch_batch_size,
                 "payload_byte_bound": False,
                 "coordinate_density": plan.coordinate_density,
                 "strategy_sparse_fragments": plan.sparse_fragments,
                 "take_rows_calls": 0,
+                "completion_order_output": True,
+                "completion_order_reordered_batches": 0,
+                "batch_stable_ids_sorted": True,
+                "exact_operation_coverage": not operations,
                 "stream_complete": not operations,
             }
         )
         if not operations:
             return
 
+        limit = self.config.max_pending_fetch_batches
+        ready: Queue[
+            _CompletedPayloadRead | _PayloadProducerSummary | _PayloadProducerError
+        ] = Queue(maxsize=limit)
+        completions: Queue[tuple[int, Optional[Future[_TimedPayloadReadBatch]]]] = (
+            Queue()
+        )
+        cancelled = Event()
+        producer_done = Event()
         pending: dict[int, Future[_TimedPayloadReadBatch]] = {}
         next_operation = 0
         read_intervals: list[tuple[float, float]] = []
+        completion_indices: list[int] = []
+        metrics_condition = Condition()
+        in_flight_count = 0
+        ready_payload_count = 0
+        consumer_held_count = 0
+        peak_in_flight = 0
+        peak_ready = 0
+        peak_producer = 0
+        peak_total = 0
+        projected = [source for source, _ in self._columns]
+
+        def update_peaks(*, local_batches: int = 0) -> None:
+            nonlocal peak_in_flight, peak_ready, peak_producer, peak_total
+            producer_batches = in_flight_count + ready_payload_count + local_batches
+            peak_in_flight = max(peak_in_flight, in_flight_count)
+            peak_ready = max(peak_ready, ready_payload_count)
+            peak_producer = max(peak_producer, producer_batches)
+            peak_total = max(peak_total, producer_batches + consumer_held_count)
+
+        def completion_callback(
+            operation_index: int,
+            future: Future[_TimedPayloadReadBatch],
+        ) -> None:
+            completions.put((operation_index, future))
 
         def fill_window() -> None:
-            nonlocal next_operation
+            nonlocal in_flight_count, next_operation
             while (
                 next_operation < len(operations)
-                and len(pending) < self.config.max_pending_fetch_batches
+                and len(pending) < limit
+                and not cancelled.is_set()
             ):
-                pending[next_operation] = self._executor.submit(
+                operation_index = next_operation
+                future = self._executor.submit(
                     self._read_operation,
-                    operations[next_operation],
-                    [source for source, _ in self._columns],
+                    operations[operation_index],
+                    projected,
+                )
+                pending[operation_index] = future
+                with metrics_condition:
+                    in_flight_count += 1
+                    update_peaks()
+                future.add_done_callback(
+                    lambda completed, index=operation_index: completion_callback(
+                        index, completed
+                    )
                 )
                 next_operation += 1
-            state["max_pending_payload_reads"] = max(
-                int(state["max_pending_payload_reads"]), len(pending)
-            )
 
-        execution_started = time.perf_counter()
-        fill_window()
-        try:
-            for operation_index, operation in enumerate(operations):
-                future = pending.pop(operation_index)
-                timed_batch = future.result()
-                batch = timed_batch.batch
-                read_intervals.append((timed_batch.started, timed_batch.finished))
-                if batch.row_ids != operation.row_ids:
-                    raise RuntimeError(
-                        "streaming Lance read changed stable row-ID order or coverage"
-                    )
-                state["max_retained_payload_batches"] = max(
-                    int(state["max_retained_payload_batches"]), len(pending) + 1
-                )
-                state["payload_take_calls"] = int(state["payload_take_calls"]) + 1
-                state["payload_read_calls"] = int(state["payload_read_calls"]) + 1
-                state["take_rows_calls"] = int(state["take_rows_calls"]) + 1
-                state["payload_batches_emitted"] = operation_index + 1
-                call_sum, active_union, envelope = _read_interval_metrics(
-                    read_intervals
-                )
-                state["payload_read_call_sum_seconds"] = call_sum
-                state["payload_read_active_union_seconds"] = active_union
-                state["payload_read_envelope_seconds"] = envelope
-                # Backward-compatible name, now explicitly a read-only denominator.
-                state["payload_read_execution_seconds"] = active_union
-                state["payload_read_scheduler_wall_seconds"] = (
-                    time.perf_counter() - execution_started
-                )
-                state["stream_complete"] = operation_index + 1 == len(operations)
-                yield batch
-                del batch
-                fill_window()
-        finally:
+        def put_ready(
+            item: _CompletedPayloadRead
+            | _PayloadProducerSummary
+            | _PayloadProducerError,
+            *,
+            payload_batch: bool,
+        ) -> bool:
+            nonlocal ready_payload_count
+            while not cancelled.is_set():
+                try:
+                    ready.put(item, timeout=0.05)
+                    if payload_batch:
+                        with metrics_condition:
+                            ready_payload_count += 1
+                            update_peaks()
+                            metrics_condition.notify_all()
+                    return True
+                except Full:
+                    if payload_batch:
+                        with metrics_condition:
+                            update_peaks(local_batches=1)
+            return False
+
+        def drain_pending() -> None:
             unfinished = tuple(pending.values())
             for future in unfinished:
                 future.cancel()
             if unfinished:
                 wait(unfinished)
+
+        def produce() -> None:
+            nonlocal in_flight_count
+            scheduler_started = time.perf_counter()
+            try:
+                fill_window()
+                while pending and not cancelled.is_set():
+                    operation_index, completed = completions.get()
+                    if completed is None or cancelled.is_set():
+                        break
+                    expected_future = pending.pop(operation_index, None)
+                    if expected_future is None:
+                        continue
+                    if expected_future is not completed:
+                        raise RuntimeError(
+                            "payload completion referred to an unexpected future"
+                        )
+                    with metrics_condition:
+                        in_flight_count -= 1
+                        update_peaks(local_batches=1)
+                    timed_batch = completed.result()
+                    batch = timed_batch.batch
+                    operation = operations[operation_index]
+                    if batch.row_ids != operation.row_ids:
+                        raise RuntimeError(
+                            "streaming Lance read changed stable row-ID order or coverage"
+                        )
+                    if any(
+                        current <= previous
+                        for previous, current in zip(
+                            batch.row_ids, batch.row_ids[1:], strict=False
+                        )
+                    ):
+                        raise RuntimeError(
+                            "streaming Lance read returned unsorted stable row IDs"
+                        )
+                    read_intervals.append((timed_batch.started, timed_batch.finished))
+                    completion_indices.append(operation_index)
+                    if not put_ready(
+                        _CompletedPayloadRead(operation_index, timed_batch),
+                        payload_batch=True,
+                    ):
+                        return
+                    fill_window()
+
+                if cancelled.is_set():
+                    return
+                expected_indices = tuple(range(len(operations)))
+                if tuple(sorted(completion_indices)) != expected_indices:
+                    raise RuntimeError(
+                        "payload producer completed duplicate or missing operations"
+                    )
+                summary = _PayloadProducerSummary(
+                    completion_indices=tuple(completion_indices),
+                    read_intervals=tuple(read_intervals),
+                    scheduler_seconds=time.perf_counter() - scheduler_started,
+                )
+                put_ready(summary, payload_batch=False)
+            except BaseException as exc:
+                drain_pending()
+                if not cancelled.is_set():
+                    put_ready(_PayloadProducerError(exc), payload_batch=False)
+            finally:
+                drain_pending()
+                producer_done.set()
+
+        producer = Thread(
+            target=produce,
+            name="lance-ray-payload-producer",
+            daemon=False,
+        )
+        producer.start()
+        emitted_indices: list[int] = []
+        try:
+            while True:
+                item = ready.get()
+                if isinstance(item, _PayloadProducerError):
+                    raise item.error
+                if isinstance(item, _PayloadProducerSummary):
+                    expected_indices = tuple(range(len(operations)))
+                    if tuple(emitted_indices) != item.completion_indices:
+                        raise RuntimeError(
+                            "payload stream changed producer completion order"
+                        )
+                    if tuple(sorted(emitted_indices)) != expected_indices:
+                        raise RuntimeError(
+                            "payload stream emitted duplicate or missing operations"
+                        )
+                    call_sum, active_union, envelope = _read_interval_metrics(
+                        item.read_intervals
+                    )
+                    peak_running = _peak_read_concurrency(item.read_intervals)
+                    reordered = sum(
+                        operation_index != output_index
+                        for output_index, operation_index in enumerate(emitted_indices)
+                    )
+                    state.update(
+                        {
+                            "payload_take_calls": len(emitted_indices),
+                            "payload_read_calls": len(emitted_indices),
+                            "take_rows_calls": len(emitted_indices),
+                            "payload_batches_emitted": len(emitted_indices),
+                            "payload_read_call_sum_seconds": call_sum,
+                            "payload_read_active_union_seconds": active_union,
+                            "payload_read_envelope_seconds": envelope,
+                            "payload_read_execution_seconds": active_union,
+                            "payload_read_scheduler_wall_seconds": (
+                                item.scheduler_seconds
+                            ),
+                            "max_pending_payload_reads": peak_in_flight,
+                            "max_retained_payload_batches": peak_total,
+                            "peak_in_flight_payload_reads": peak_in_flight,
+                            "peak_running_payload_reads": peak_running,
+                            "peak_ready_payload_batches": peak_ready,
+                            "peak_producer_retained_payload_batches": (peak_producer),
+                            "peak_total_retained_payload_batches": peak_total,
+                            "retained_payload_batch_upper_bound": 2 * limit + 1,
+                            "consumer_held_payload_batch_limit": 1,
+                            "completion_order_reordered_batches": reordered,
+                            "exact_operation_coverage": True,
+                            "stream_complete": True,
+                        }
+                    )
+                    break
+
+                with metrics_condition:
+                    while ready_payload_count <= 0:
+                        metrics_condition.wait(timeout=0.05)
+                    ready_payload_count -= 1
+                    consumer_held_count = 1
+                    update_peaks()
+                emitted_indices.append(item.operation_index)
+                try:
+                    yield item.timed_batch.batch
+                finally:
+                    with metrics_condition:
+                        consumer_held_count = 0
+                        update_peaks()
+        finally:
+            cancelled.set()
+            completions.put((-1, None))
+            producer.join()
+            if not producer_done.is_set():
+                raise RuntimeError("payload producer failed to terminate")
 
     def _iter_stable_row_ids_unlocked(
         self,
@@ -1880,7 +2111,7 @@ class LanceStableIdPayloadStreamer:
         *,
         stable_row_id_column: str = "stable_row_id",
     ) -> Iterator[pa.Table]:
-        """Yield projected payloads for pre-sorted unique stable ordinals."""
+        """Yield completion-ordered payload batches for sorted unique ordinals."""
         if self._closed:
             raise RuntimeError("LanceStableIdPayloadStreamer is closed")
         if not self._iterator_lock.acquire(blocking=False):

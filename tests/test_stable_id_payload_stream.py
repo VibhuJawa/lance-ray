@@ -87,8 +87,11 @@ def test_stable_id_payload_stream_is_sidecar_free_ordered_and_final_metrics(
     assert combined.column_names == ["stable_row_id", "payload", "payload_width"]
     assert combined["stable_row_id"].type == pa.uint64()
     assert combined["stable_row_id"].null_count == 0
-    assert combined["stable_row_id"].to_pylist() == [row_id for row_id, _ in expected]
-    payloads = combined["payload"].to_pylist()
+    stable_sorted = combined.sort_by([("stable_row_id", "ascending")])
+    assert stable_sorted["stable_row_id"].to_pylist() == [
+        row_id for row_id, _ in expected
+    ]
+    payloads = stable_sorted["payload"].to_pylist()
     assert payloads == [f"image-{key}".encode() for _, key in expected]
     assert (
         hashlib.sha256(b"".join(payloads)).hexdigest()
@@ -102,14 +105,21 @@ def test_stable_id_payload_stream_is_sidecar_free_ordered_and_final_metrics(
     assert metrics["input_stable_rows"] == 4
     assert metrics["stream_output_rows"] == 4
     assert metrics["payload_batches_emitted"] == 2
-    assert metrics["max_pending_payload_reads"] == 2
-    assert metrics["max_retained_payload_batches"] == 2
+    assert metrics["completion_order_output"] is True
+    assert metrics["batch_stable_ids_sorted"] is True
+    assert metrics["exact_operation_coverage"] is True
+    assert metrics["peak_in_flight_payload_reads"] <= 2
+    assert 1 <= metrics["peak_running_payload_reads"] <= 2
+    assert metrics["peak_ready_payload_batches"] <= 2
+    assert metrics["peak_producer_retained_payload_batches"] <= 4
+    assert metrics["peak_total_retained_payload_batches"] <= 5
+    assert metrics["retained_payload_batch_upper_bound"] == 5
     assert metrics["payload_batch_row_limit"] == 2
     assert metrics["payload_byte_bound"] is False
     reader.close()
 
 
-def test_stable_id_payload_stream_delayed_future_is_bounded_and_ordered(
+def test_stable_id_payload_stream_avoids_head_of_line_blocking(
     tmp_path: Path,
 ) -> None:
     dataset, mapping = _stable_dataset(tmp_path)
@@ -117,45 +127,88 @@ def test_stable_id_payload_stream_delayed_future_is_bounded_and_ordered(
         _config(dataset, fetch_batch_size=1), dataset=dataset
     )
     original_read = reader._read_operation
-    second_finished = threading.Event()
-    third_started = threading.Event()
+    release_first = threading.Event()
+    first_started = threading.Event()
     submitted = []
-    finished = []
 
     def delayed_read(operation, projected):
         row_id = operation.row_ids[0]
         submitted.append(row_id)
-        if row_id == 2:
-            third_started.set()
         if row_id == 0:
-            assert second_finished.wait(timeout=5)
-        result = original_read(operation, projected)
-        finished.append(row_id)
-        if row_id == 1:
-            second_finished.set()
-        return result
+            first_started.set()
+            assert release_first.wait(timeout=5)
+        return original_read(operation, projected)
 
     reader._read_operation = delayed_read
     row_ids = pa.array(sorted(mapping.values())[:4], type=pa.uint64())
     iterator = reader.iter_stable_row_ids(row_ids)
 
     first = next(iterator)
-    assert first["stable_row_id"].to_pylist() == [0]
-    assert submitted == [0, 1]
-    assert finished[:2] == [1, 0]
-    second = next(iterator)
-    assert second["stable_row_id"].to_pylist() == [1]
-    assert third_started.wait(timeout=5)
-    assert submitted == [0, 1, 2]
-    outputs = [first, second, *list(iterator)]
+    assert first_started.is_set()
+    assert first["stable_row_id"].to_pylist() == [1]
+    assert submitted[:2] == [0, 1]
+    release_first.set()
+    outputs = [first, *list(iterator)]
 
-    assert [table["stable_row_id"].to_pylist()[0] for table in outputs] == [
-        0,
-        1,
-        2,
-        3,
+    emitted = [table["stable_row_id"].to_pylist()[0] for table in outputs]
+    assert emitted[0] == 1
+    assert sorted(emitted) == [0, 1, 2, 3]
+    assert reader.last_metrics["completion_order_reordered_batches"] >= 2
+    assert reader.last_metrics["exact_operation_coverage"] is True
+    reader.close()
+
+
+def test_stable_id_payload_stream_refills_while_consumer_is_paused(
+    tmp_path: Path,
+) -> None:
+    dataset, mapping = _stable_dataset(tmp_path)
+    reader = LanceStableIdPayloadStreamer(
+        _config(
+            dataset,
+            fetch_batch_size=1,
+            io_threads=2,
+            max_pending_fetch_batches=2,
+        ),
+        dataset=dataset,
+    )
+    original_read = reader._read_operation
+    fifth_started = threading.Event()
+    started = []
+
+    def recorded_read(operation, projected):
+        row_id = operation.row_ids[0]
+        started.append(row_id)
+        if row_id == 4:
+            fifth_started.set()
+        return original_read(operation, projected)
+
+    reader._read_operation = recorded_read
+    row_ids = pa.array(sorted(mapping.values()), type=pa.uint64())
+    iterator = reader.iter_stable_row_ids(row_ids)
+
+    first = next(iterator)
+    # No additional next() call is made while the producer refills behind the
+    # bounded ready queue.
+    assert fifth_started.wait(timeout=5)
+    outputs = [first, *list(iterator)]
+
+    emitted = [
+        row_id for table in outputs for row_id in table["stable_row_id"].to_pylist()
     ]
-    assert reader.last_metrics["max_retained_payload_batches"] == 2
+    assert sorted(emitted) == list(range(6))
+    assert len(emitted) == len(set(emitted)) == 6
+    assert set(started) == set(range(6))
+    metrics = reader.last_metrics
+    assert metrics["payload_batches_planned"] == 6
+    assert metrics["payload_batches_emitted"] == 6
+    assert metrics["peak_in_flight_payload_reads"] <= 2
+    assert 1 <= metrics["peak_running_payload_reads"] <= 2
+    assert metrics["peak_ready_payload_batches"] <= 2
+    assert metrics["peak_producer_retained_payload_batches"] <= 4
+    assert metrics["peak_total_retained_payload_batches"] <= 5
+    assert metrics["retained_payload_batch_upper_bound"] == 5
+    assert metrics["exact_operation_coverage"] is True
+    assert metrics["stream_complete"] is True
     reader.close()
 
 
@@ -195,6 +248,10 @@ def test_stable_id_payload_stream_partial_consumption_has_no_final_metrics(
     closer.join()
 
     assert reader.last_metrics == {}
+    assert not any(
+        thread.name == "lance-ray-payload-producer" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
     reader.close()
 
 
@@ -231,6 +288,11 @@ def test_stable_id_payload_stream_rejects_overlap_and_releases_every_path(
     reader._read_operation = failed_read
     with pytest.raises(RuntimeError, match="injected read failure"):
         list(reader.iter_stable_row_ids(row_ids))
+    assert reader.last_metrics == {}
+    assert not any(
+        thread.name == "lance-ray-payload-producer" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
     reader._read_operation = original_read
     assert sum(table.num_rows for table in reader.iter_stable_row_ids(row_ids)) == 3
     reader.close()
@@ -260,9 +322,17 @@ def test_stable_id_payload_stream_read_timing_excludes_caller_pause(
     active = metrics["payload_read_active_union_seconds"]
     assert metrics["payload_read_execution_seconds"] == active
     assert metrics["payload_read_call_sum_seconds"] >= active
-    assert metrics["payload_read_envelope_seconds"] - active >= 0.15
-    assert metrics["payload_read_scheduler_wall_seconds"] - active >= 0.15
     assert metrics["payload_stream_wall_seconds"] - active >= 0.15
+    assert (
+        metrics["payload_stream_wall_seconds"]
+        - metrics["payload_read_envelope_seconds"]
+        >= 0.15
+    )
+    assert (
+        metrics["payload_stream_wall_seconds"]
+        - metrics["payload_read_scheduler_wall_seconds"]
+        >= 0.15
+    )
     if metrics["lance_read_iops"]:
         assert metrics["physical_read_operations_per_second"] == pytest.approx(
             metrics["lance_read_iops"] / active
