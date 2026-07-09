@@ -5,7 +5,7 @@ This package provides integration between Ray and Lance for distributed
 columnar data processing.
 """
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 __author__ = "LanceDB Devs"
 __email__ = "dev@lancedb.com"
 from .compaction import compact_database, compact_files
@@ -15,6 +15,17 @@ from .datasink import LanceFragmentCommitter
 
 # Fragment API imports
 from .fragment import LanceFragmentWriter
+from .gpu import (
+    GpuLanceColumnFetcher,
+    GpuLanceFetchConfig,
+    GpuLanceUniquePayloadStreamer,
+    LancePayloadShutdownTimeoutError,
+    LanceStableIdPayloadConfig,
+    LanceStableIdPayloadStreamer,
+    fetch_lance_columns_on_gpu,
+    get_gpu_fetch_metrics,
+    stream_unique_lance_columns_on_gpu,
+)
 from .index import create_index, create_scalar_index, optimize_indices
 from .io import (
     add_columns,
@@ -44,4 +55,13 @@ __all__ = [
     "compact_database",
     "LanceFragmentWriter",
     "LanceFragmentCommitter",
+    "GpuLanceColumnFetcher",
+    "GpuLanceFetchConfig",
+    "GpuLanceUniquePayloadStreamer",
+    "LancePayloadShutdownTimeoutError",
+    "LanceStableIdPayloadConfig",
+    "LanceStableIdPayloadStreamer",
+    "fetch_lance_columns_on_gpu",
+    "get_gpu_fetch_metrics",
+    "stream_unique_lance_columns_on_gpu",
 ]
