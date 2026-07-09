@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sys
 import time
 from bisect import bisect_left, bisect_right
@@ -26,7 +27,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
     from ray.data import Dataset
 
@@ -294,6 +295,12 @@ class LanceStableIdPayloadConfig:
     row-bounded payload batches; the generator can additionally expose one
     current batch, for an internal bound of ``2 * limit + 1``. Caller-retained
     outputs are outside this bound. This is not a payload-byte bound.
+
+    ``shutdown_timeout_seconds`` bounds cooperative iterator cancellation and
+    executor shutdown. Python cannot interrupt a native PyLance call that is
+    already running; if one outlives this deadline, the caller receives
+    :class:`LancePayloadShutdownTimeoutError` and may still need to terminate
+    the process.
     """
 
     dataset_uri: str
@@ -306,6 +313,7 @@ class LanceStableIdPayloadConfig:
     max_pending_fetch_batches: int = 16
     index_cache_size_bytes: Optional[int] = None
     metadata_cache_size_bytes: Optional[int] = None
+    shutdown_timeout_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         try:
@@ -321,6 +329,18 @@ class LanceStableIdPayloadConfig:
             raise TypeError("dataset_uri must be a string")
         if not self.dataset_uri:
             raise ValueError("dataset_uri must not be empty")
+        shutdown_timeout_seconds = self.shutdown_timeout_seconds
+        if isinstance(shutdown_timeout_seconds, bool) or not isinstance(
+            shutdown_timeout_seconds, int | float
+        ):
+            raise TypeError("shutdown_timeout_seconds must be a finite number")
+        if not math.isfinite(shutdown_timeout_seconds) or shutdown_timeout_seconds <= 0:
+            raise ValueError(
+                "shutdown_timeout_seconds must be finite and greater than zero"
+            )
+        object.__setattr__(
+            self, "shutdown_timeout_seconds", float(shutdown_timeout_seconds)
+        )
         for name in (
             "dataset_version",
             "expected_rows",
@@ -361,6 +381,26 @@ class LanceStableIdPayloadConfig:
                 raise TypeError(f"{name} must be an integer or None")
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be nonnegative or None")
+
+
+class LancePayloadShutdownTimeoutError(TimeoutError):
+    """Raised when cooperative payload shutdown exceeds its finite deadline."""
+
+    def __init__(
+        self,
+        message: str,
+        metrics: dict[str, int | float | bool | str],
+    ) -> None:
+        super().__init__(message)
+        self.metrics = dict(metrics)
+
+    def __reduce__(
+        self,
+    ) -> tuple[
+        type[LancePayloadShutdownTimeoutError],
+        tuple[str, dict[str, int | float | bool | str]],
+    ]:
+        return type(self), (str(self), self.metrics)
 
 
 @dataclass(frozen=True)
@@ -433,6 +473,17 @@ class _PayloadProducerSummary:
 @dataclass(frozen=True)
 class _PayloadProducerError:
     error: BaseException
+
+
+@dataclass(frozen=True)
+class _PayloadProducerCancelled:
+    pass
+
+
+@dataclass(frozen=True)
+class _ActivePayloadIteratorShutdown:
+    cancel: Callable[[], None]
+    producer: Thread
 
 
 @dataclass(frozen=True)
@@ -1617,7 +1668,18 @@ class LanceStableIdPayloadStreamer:
     caller-retained outputs are outside that contract. This is not a byte bound
     because one payload can be arbitrarily large. ``last_metrics`` is replaced
     only after complete iterator exhaustion; partial consumption publishes no
-    final metrics.
+    final metrics. ``last_shutdown_metrics`` separately records the latest
+    iterator or executor teardown without changing completed-stream metrics.
+
+    Shutdown is cooperatively bounded by ``shutdown_timeout_seconds``. Queued
+    futures are cancelled, but Python cannot stop a native in-flight PyLance
+    call. A timeout therefore raises :class:`LancePayloadShutdownTimeoutError`;
+    process-level termination may still be required to stop the native call.
+    Iterator and executor teardown share one deadline, and an iterator timeout
+    permanently closes the streamer so unfinished I/O cannot contaminate a
+    later stream's incremental metrics. ``close`` also wakes and joins an
+    active producer; the caller still owns and should close any suspended
+    generator so its deferred dataset references can be released.
     """
 
     def __init__(
@@ -1649,6 +1711,7 @@ class LanceStableIdPayloadStreamer:
         self._iterator_lock = Lock()
         self.last_metrics: dict[str, int | float | bool] = {}
         self.cumulative_metrics: dict[str, int | float] = {}
+        self.last_shutdown_metrics: dict[str, int | float | bool | str] = {}
         if dataset is None:
             self._session = session or lance.Session(
                 index_cache_size_bytes=config.index_cache_size_bytes,
@@ -1689,18 +1752,131 @@ class LanceStableIdPayloadStreamer:
                 )
             )
         self._output_schema = pa.schema(output_fields)
-        self._executor = ThreadPoolExecutor(
+        self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
             max_workers=config.io_threads,
             thread_name_prefix="lance-ray-stable-id-fetch",
         )
+        self._executor_shutdown_thread: Thread | None = None
+        self._executor_shutdown_error: BaseException | None = None
+        self._executor_shutdown_lock = Lock()
+        self._shutdown_deadline_lock = Lock()
+        self._shutdown_deadline: float | None = None
+        self._active_iterator_shutdown_lock = Lock()
+        self._active_iterator_shutdown: _ActivePayloadIteratorShutdown | None = None
+
+    def _begin_shutdown_budget(self) -> tuple[float, bool]:
+        with self._shutdown_deadline_lock:
+            reused = self._shutdown_deadline is not None
+            if self._shutdown_deadline is None:
+                self._shutdown_deadline = (
+                    time.perf_counter() + self.config.shutdown_timeout_seconds
+                )
+            return self._shutdown_deadline, reused
+
+    def _reset_shutdown_budget(self, deadline: float) -> None:
+        with self._shutdown_deadline_lock:
+            if self._shutdown_deadline == deadline:
+                self._shutdown_deadline = None
+
+    def _release_dataset_if_idle(self) -> None:
+        if not self._iterator_lock.locked():
+            self._dataset = None
+            self._session = None
+
+    def _start_payload_producer(
+        self,
+        shutdown: _ActivePayloadIteratorShutdown,
+    ) -> None:
+        with self._active_iterator_shutdown_lock:
+            if self._closed:
+                raise RuntimeError("LanceStableIdPayloadStreamer is closed")
+            if self._active_iterator_shutdown is not None:  # pragma: no cover
+                raise RuntimeError("stable-ID payload iterator is already registered")
+            self._active_iterator_shutdown = shutdown
+            shutdown.producer.start()
+
+    def _clear_payload_producer(self, producer: Thread) -> None:
+        with self._active_iterator_shutdown_lock:
+            active = self._active_iterator_shutdown
+            if active is not None and active.producer is producer:
+                self._active_iterator_shutdown = None
+
+    def _close_and_cancel_payload_producer(self) -> Thread | None:
+        with self._active_iterator_shutdown_lock:
+            self._closed = True
+            active = self._active_iterator_shutdown
+        if active is None:
+            return None
+        active.cancel()
+        return active.producer
+
+    def _start_executor_shutdown(self) -> tuple[Thread, Thread | None]:
+        producer = self._close_and_cancel_payload_producer()
+        with self._executor_shutdown_lock:
+            if self._executor_shutdown_thread is not None:
+                return self._executor_shutdown_thread, producer
+            executor = self._executor
+            if executor is None:  # pragma: no cover - guarded by callers
+                raise RuntimeError("Lance payload executor is already closed")
+
+            def shutdown_executor() -> None:
+                try:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                except BaseException as exc:  # pragma: no cover - stdlib failure
+                    self._executor_shutdown_error = exc
+
+            self._executor_shutdown_thread = Thread(
+                target=shutdown_executor,
+                name="lance-ray-payload-executor-shutdown",
+                daemon=True,
+            )
+            self._executor_shutdown_thread.start()
+            return self._executor_shutdown_thread, producer
 
     def close(self) -> None:
-        if self._closed:
+        if self._executor is None:
             return
-        self._closed = True
-        self._executor.shutdown(wait=True, cancel_futures=True)
-        self._dataset = None
-        self._session = None
+        shutdown_started = time.perf_counter()
+        deadline, budget_reused = self._begin_shutdown_budget()
+        budget_remaining_at_start = max(0.0, deadline - shutdown_started)
+        shutdown_thread, producer = self._start_executor_shutdown()
+
+        if producer is not None:
+            producer.join(timeout=max(0.0, deadline - time.perf_counter()))
+        producer_alive = producer is not None and producer.is_alive()
+        shutdown_thread.join(timeout=max(0.0, deadline - time.perf_counter()))
+        shutdown_wait_seconds = time.perf_counter() - shutdown_started
+        executor_shutdown_alive = shutdown_thread.is_alive()
+        shutdown_timed_out = producer_alive or executor_shutdown_alive
+        shutdown_metrics: dict[str, int | float | bool | str] = {
+            "shutdown_phase": "executor",
+            "shutdown_timeout_seconds": self.config.shutdown_timeout_seconds,
+            "shutdown_wait_seconds": shutdown_wait_seconds,
+            "shutdown_timed_out": shutdown_timed_out,
+            "shutdown_budget_reused": budget_reused,
+            "shutdown_budget_seconds_remaining_at_start": (budget_remaining_at_start),
+            "producer_thread_alive": producer_alive,
+            "executor_shutdown_thread_alive": executor_shutdown_alive,
+            "native_calls_may_still_be_running": executor_shutdown_alive,
+        }
+        self.last_shutdown_metrics = shutdown_metrics
+        if shutdown_timed_out:
+            raise LancePayloadShutdownTimeoutError(
+                "Lance payload streamer did not shut down within "
+                f"{self.config.shutdown_timeout_seconds:.3f} seconds; "
+                f"producer_alive={producer_alive}, "
+                f"executor_shutdown_alive={executor_shutdown_alive}. Python cannot "
+                "interrupt a native in-flight PyLance call, so process-level "
+                "termination may still be required",
+                shutdown_metrics,
+            )
+        if self._executor_shutdown_error is not None:
+            raise RuntimeError("Lance payload executor shutdown failed") from (
+                self._executor_shutdown_error
+            )
+        self._executor = None
+        self._reset_shutdown_budget(deadline)
+        self._release_dataset_if_idle()
 
     def __del__(self) -> None:  # pragma: no cover - interpreter teardown
         with suppress(Exception):
@@ -1809,7 +1985,10 @@ class LanceStableIdPayloadStreamer:
 
         limit = self.config.max_pending_fetch_batches
         ready: Queue[
-            _CompletedPayloadRead | _PayloadProducerSummary | _PayloadProducerError
+            _CompletedPayloadRead
+            | _PayloadProducerSummary
+            | _PayloadProducerError
+            | _PayloadProducerCancelled
         ] = Queue(maxsize=limit)
         completions: Queue[tuple[int, Optional[Future[_TimedPayloadReadBatch]]]] = (
             Queue()
@@ -1817,6 +1996,8 @@ class LanceStableIdPayloadStreamer:
         cancelled = Event()
         producer_done = Event()
         pending: dict[int, Future[_TimedPayloadReadBatch]] = {}
+        cancelled_futures_lock = Lock()
+        cancelled_futures: set[Future[_TimedPayloadReadBatch]] = set()
         next_operation = 0
         read_intervals: list[tuple[float, float]] = []
         completion_indices: list[int] = []
@@ -1852,7 +2033,10 @@ class LanceStableIdPayloadStreamer:
                 and not cancelled.is_set()
             ):
                 operation_index = next_operation
-                future = self._executor.submit(
+                executor = self._executor
+                if executor is None:
+                    raise RuntimeError("LanceStableIdPayloadStreamer is closed")
+                future = executor.submit(
                     self._read_operation,
                     operations[operation_index],
                     projected,
@@ -1871,7 +2055,8 @@ class LanceStableIdPayloadStreamer:
         def put_ready(
             item: _CompletedPayloadRead
             | _PayloadProducerSummary
-            | _PayloadProducerError,
+            | _PayloadProducerError
+            | _PayloadProducerCancelled,
             *,
             payload_batch: bool,
         ) -> bool:
@@ -1891,12 +2076,18 @@ class LanceStableIdPayloadStreamer:
                             update_peaks(local_batches=1)
             return False
 
+        def request_cancel() -> None:
+            cancelled.set()
+            completions.put((-1, None))
+            with suppress(Full):
+                ready.put_nowait(_PayloadProducerCancelled())
+
         def drain_pending() -> None:
             unfinished = tuple(pending.values())
             for future in unfinished:
-                future.cancel()
-            if unfinished:
-                wait(unfinished)
+                if future.cancel():
+                    with cancelled_futures_lock:
+                        cancelled_futures.add(future)
 
         def produce() -> None:
             nonlocal in_flight_count
@@ -1968,11 +2159,17 @@ class LanceStableIdPayloadStreamer:
             name="lance-ray-payload-producer",
             daemon=False,
         )
-        producer.start()
+        self._start_payload_producer(
+            _ActivePayloadIteratorShutdown(cancel=request_cancel, producer=producer)
+        )
         emitted_indices: list[int] = []
         try:
             while True:
+                if cancelled.is_set():
+                    break
                 item = ready.get()
+                if cancelled.is_set() or isinstance(item, _PayloadProducerCancelled):
+                    break
                 if isinstance(item, _PayloadProducerError):
                     raise item.error
                 if isinstance(item, _PayloadProducerSummary):
@@ -2036,9 +2233,61 @@ class LanceStableIdPayloadStreamer:
                         consumer_held_count = 0
                         update_peaks()
         finally:
-            cancelled.set()
-            completions.put((-1, None))
-            producer.join()
+            shutdown_started = time.perf_counter()
+            deadline, budget_reused = self._begin_shutdown_budget()
+            budget_remaining_at_start = max(0.0, deadline - shutdown_started)
+            request_cancel()
+            producer.join(timeout=max(0.0, deadline - time.perf_counter()))
+            producer_alive = producer.is_alive()
+            if not producer_alive:
+                self._clear_payload_producer(producer)
+            with cancelled_futures_lock:
+                pending_cancelled = len(cancelled_futures)
+            pending_unfinished = 0
+            if not producer_alive:
+                unfinished = tuple(
+                    future for future in pending.values() if not future.done()
+                )
+                if unfinished:
+                    _, not_done = wait(
+                        unfinished,
+                        timeout=max(0.0, deadline - time.perf_counter()),
+                    )
+                    pending_unfinished = len(not_done)
+            shutdown_wait_seconds = time.perf_counter() - shutdown_started
+            shutdown_timed_out = producer_alive or pending_unfinished > 0
+            shutdown_metrics: dict[str, int | float | bool | str] = {
+                "shutdown_phase": "iterator",
+                "shutdown_timeout_seconds": self.config.shutdown_timeout_seconds,
+                "shutdown_wait_seconds": shutdown_wait_seconds,
+                "shutdown_timed_out": shutdown_timed_out,
+                "shutdown_budget_reused": budget_reused,
+                "shutdown_budget_seconds_remaining_at_start": (
+                    budget_remaining_at_start
+                ),
+                "cancelled_pending_payload_reads": pending_cancelled,
+                "unfinished_payload_reads": pending_unfinished,
+                "producer_thread_alive": producer_alive,
+                "native_calls_may_still_be_running": (
+                    producer_alive or pending_unfinished > 0
+                ),
+            }
+            if shutdown_timed_out:
+                self._start_executor_shutdown()
+                shutdown_metrics["executor_shutdown_started"] = True
+                self.last_shutdown_metrics = shutdown_metrics
+                raise LancePayloadShutdownTimeoutError(
+                    "Lance payload iterator did not shut down within "
+                    f"{self.config.shutdown_timeout_seconds:.3f} seconds; "
+                    f"producer_alive={producer_alive}, "
+                    f"unfinished_payload_reads={pending_unfinished}. "
+                    "Python cannot interrupt a native in-flight PyLance call, so "
+                    "process-level termination may still be required",
+                    shutdown_metrics,
+                )
+            shutdown_metrics["executor_shutdown_started"] = False
+            self.last_shutdown_metrics = shutdown_metrics
+            self._reset_shutdown_budget(deadline)
             if not producer_done.is_set():
                 raise RuntimeError("payload producer failed to terminate")
 
@@ -2069,6 +2318,8 @@ class LanceStableIdPayloadStreamer:
         finally:
             batches.close()
 
+        if not bool(state.get("stream_complete", False)):
+            return
         io_stats = self._dataset.io_stats_incremental()
         execution_seconds = float(state["payload_read_execution_seconds"])
         read_calls = int(state["payload_read_calls"])
@@ -2112,18 +2363,21 @@ class LanceStableIdPayloadStreamer:
         stable_row_id_column: str = "stable_row_id",
     ) -> Iterator[pa.Table]:
         """Yield completion-ordered payload batches for sorted unique ordinals."""
-        if self._closed:
-            raise RuntimeError("LanceStableIdPayloadStreamer is closed")
         if not self._iterator_lock.acquire(blocking=False):
             raise RuntimeError("only one stable-ID payload iterator may be active")
         try:
+            if self._closed:
+                raise RuntimeError("LanceStableIdPayloadStreamer is closed")
             self.last_metrics = {}
+            self.last_shutdown_metrics = {}
             yield from self._iter_stable_row_ids_unlocked(
                 values,
                 stable_row_id_column=stable_row_id_column,
             )
         finally:
             self._iterator_lock.release()
+            if self._closed and self._executor is None:
+                self._release_dataset_if_idle()
 
 
 class GpuLanceUniquePayloadStreamer(GpuLanceColumnFetcher):
@@ -2644,6 +2898,7 @@ __all__ = [
     "GpuLanceColumnFetcher",
     "GpuLanceFetchConfig",
     "GpuLanceUniquePayloadStreamer",
+    "LancePayloadShutdownTimeoutError",
     "LanceStableIdPayloadConfig",
     "LanceStableIdPayloadStreamer",
     "fetch_lance_columns_on_gpu",

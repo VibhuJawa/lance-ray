@@ -135,3 +135,20 @@ coverage, and full physical fragment coverage fail closed. The adaptive name
 is intentional: it reports sparse takes, fragment takes, streamed scan calls
 and batches, range overread, IOPS, read size, and amplification, but it is not
 the default until a matched remote benchmark demonstrates a win.
+
+`LanceStableIdPayloadStreamer` bounds cooperative iterator and executor
+teardown with `shutdown_timeout_seconds` (five seconds by default). Pending
+futures are cancelled and a timeout raises
+`LancePayloadShutdownTimeoutError`, whose `metrics` identify whether the
+iterator producer or executor exceeded the deadline. Python cannot interrupt a
+PyLance call that is already executing in native code; such a call can outlive
+the Python deadline and may still require process-level termination. Set the
+library timeout below any enclosing process-kill grace period.
+
+Iterator cancellation and executor shutdown share one deadline rather than
+each consuming a full timeout. A timed-out iterator permanently closes its
+streamer to prevent unfinished reads from contaminating a later stream's I/O
+metrics. Calling `close()` wakes and joins an active producer, including one
+blocked behind a full ready queue. The caller still owns any suspended Python
+generator and should close or exhaust it so deferred dataset references are
+released; partial streams do not publish `last_metrics`.
