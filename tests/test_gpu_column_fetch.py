@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import pickle
 from pathlib import Path
 
 import lance
@@ -711,6 +712,35 @@ def test_ray_helper_converts_byte_target_to_coalesced_row_batch():
     assert calls["num_gpus"] == 1.0
     assert calls["memory"] == 4 * 1024**3
     assert calls["fn_constructor_args"] == (config,)
+
+
+def test_config_repr_redacts_storage_options_without_changing_serialization():
+    config = GpuLanceFetchConfig(
+        dataset_uri="s3://bucket/images.lance",
+        dataset_version=4,
+        sidecar_files=("/local/index.parquet",),
+        sidecar_manifest_uri="/local/manifest.json",
+        sidecar_manifest_sha256="0" * 64,
+        columns={"image": "fetched_image"},
+        expected_reference_rows=355_952_746,
+        dataset_storage_options={"credential": "DATASET_SECRET_SENTINEL"},
+        sidecar_storage_options={"credential": "SIDECAR_SECRET_SENTINEL"},
+    )
+
+    restored = pickle.loads(pickle.dumps(config))
+    for value in (config, restored):
+        representation = repr(value)
+        assert "DATASET_SECRET_SENTINEL" not in representation
+        assert "SIDECAR_SECRET_SENTINEL" not in representation
+        assert "dataset_storage_options" not in representation
+        assert "sidecar_storage_options" not in representation
+        assert "dataset_uri='s3://bucket/images.lance'" in representation
+        assert "dataset_version=4" in representation
+        assert "expected_reference_rows=355952746" in representation
+
+    assert restored == config
+    assert restored.dataset_storage_options == config.dataset_storage_options
+    assert restored.sidecar_storage_options == config.sidecar_storage_options
 
 
 @pytest.mark.parametrize(

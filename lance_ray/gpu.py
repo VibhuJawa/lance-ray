@@ -197,8 +197,8 @@ class GpuLanceFetchConfig:
     sidecar_row_id_column: str = "stable_row_id"
     presence_column: Optional[str] = None
     missing_key_policy: Literal["mark", "error"] = "mark"
-    dataset_storage_options: dict[str, str] = field(default_factory=dict)
-    sidecar_storage_options: dict[str, str] = field(default_factory=dict)
+    dataset_storage_options: dict[str, str] = field(default_factory=dict, repr=False)
+    sidecar_storage_options: dict[str, str] = field(default_factory=dict, repr=False)
     load_factor: float = 0.5
     max_lookup_bytes: int = 256 * 1024**2
     fetch_batch_size: int = 1024
