@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import pickle
+import threading
 from pathlib import Path
 
 import lance
@@ -12,8 +13,10 @@ from lance_ray import gpu as gpu_mod
 from lance_ray.gpu import (
     GpuLanceColumnFetcher,
     GpuLanceFetchConfig,
+    GpuLanceUniquePayloadStreamer,
     fetch_lance_columns_on_gpu,
     get_gpu_fetch_metrics,
+    stream_unique_lance_columns_on_gpu,
 )
 
 
@@ -346,6 +349,167 @@ def test_private_take_ids_are_deduplicated_sorted_and_queue_bounded(
     metrics = get_gpu_fetch_metrics(output)
     assert metrics["payload_take_calls"] == 2
     assert metrics["max_pending_fetch_batches"] == 1
+
+
+def test_unique_payload_stream_deduplicates_sorts_and_reconstructs_fanout(
+    tmp_path: Path, fake_gpu_index
+):
+    dataset, mapping = _stable_dataset(tmp_path)
+    fake_gpu_index.mapping = mapping
+    streamer = GpuLanceUniquePayloadStreamer(
+        _config(dataset, fetch_batch_size=2, max_pending_fetch_batches=2)
+    )
+    keys = ["d", "a", "d", "c", "missing", None, "b"]
+
+    outputs = list(streamer(pa.table({"origin_key": keys, "source_ref": keys})))
+
+    assert [output.num_rows for output in outputs] == [2, 2]
+    combined = pa.concat_tables(outputs)
+    expected = sorted(mapping.items(), key=lambda item: item[1])
+    assert combined["stable_row_id"].to_pylist() == [row_id for _, row_id in expected]
+    assert combined["source_ref"].to_pylist() == [key for key, _ in expected]
+    assert combined["fetched_image"].to_pylist() == [
+        f"image-{key}".encode() for key, _ in expected
+    ]
+    expected_digest = hashlib.sha256(
+        b"".join(f"image-{key}".encode() for key, _ in expected)
+    ).hexdigest()
+    actual_digest = hashlib.sha256(
+        b"".join(combined["fetched_image"].to_pylist())
+    ).hexdigest()
+    assert actual_digest == expected_digest
+
+    # The payload stream supplies key identity once. The retained inverse is
+    # fixed-width and can restore duplicate document origins without shuffling
+    # image bytes.
+    stable_id_by_key = dict(
+        zip(
+            combined["source_ref"].to_pylist(),
+            combined["stable_row_id"].to_pylist(),
+            strict=True,
+        )
+    )
+    coordinates = pa.table(
+        {
+            "origin_row": pa.array(range(len(keys)), type=pa.uint64()),
+            "stable_row_id": pa.array(
+                [stable_id_by_key.get(key) for key in keys],
+                type=pa.uint64(),
+            ),
+        }
+    )
+    payload_by_id = dict(
+        zip(
+            combined["stable_row_id"].to_pylist(),
+            combined["fetched_image"].to_pylist(),
+            strict=True,
+        )
+    )
+    reconstructed = [
+        payload_by_id.get(row_id) for row_id in coordinates["stable_row_id"].to_pylist()
+    ]
+    assert reconstructed == [
+        b"image-d",
+        b"image-a",
+        b"image-d",
+        b"image-c",
+        None,
+        None,
+        b"image-b",
+    ]
+
+    metrics = get_gpu_fetch_metrics(outputs[-1])
+    assert metrics["stream_complete"] is True
+    assert metrics["stream_output_rows"] == 4
+    assert metrics["payload_batches_emitted"] == 2
+    assert metrics["max_retained_payload_batches"] == 2
+    assert metrics["payload_byte_bound"] is False
+    assert metrics["payload_batch_row_limit"] == 2
+    assert metrics["duplicate_queries_coalesced"] == 1
+    streamer.close()
+
+
+def test_unique_payload_stream_is_ordered_with_delayed_first_future(
+    tmp_path: Path, fake_gpu_index
+):
+    dataset, mapping = _stable_dataset(tmp_path)
+    fake_gpu_index.mapping = mapping
+    streamer = GpuLanceUniquePayloadStreamer(
+        _config(
+            dataset,
+            fetch_batch_size=1,
+            max_pending_fetch_batches=2,
+            io_threads=2,
+        )
+    )
+    original_read = streamer._read_payload_operation
+    second_finished = threading.Event()
+    submitted = []
+    finished = []
+
+    def delayed_read(operation, projected):
+        row_id = operation.row_ids[0]
+        submitted.append(row_id)
+        if row_id == 0:
+            assert second_finished.wait(timeout=5)
+        elif row_id == 1:
+            second_finished.set()
+        result = original_read(operation, projected)
+        finished.append(row_id)
+        return result
+
+    streamer._read_payload_operation = delayed_read
+    iterator = streamer(pa.table({"source_ref": ["d", "c", "b", "a"]}))
+
+    first = next(iterator)
+    assert first["stable_row_id"].to_pylist() == [0]
+    assert submitted == [0, 1]
+    assert finished[:2] == [1, 0]
+
+    second = next(iterator)
+    assert second["stable_row_id"].to_pylist() == [1]
+    assert submitted == [0, 1, 2]
+    remaining = list(iterator)
+    outputs = [first, second, *remaining]
+    assert [table["stable_row_id"].to_pylist()[0] for table in outputs] == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    metrics = get_gpu_fetch_metrics(outputs[-1])
+    assert metrics["max_pending_payload_reads"] == 2
+    assert metrics["max_retained_payload_batches"] == 2
+    streamer.close()
+
+
+def test_unique_payload_stream_has_row_not_byte_bound(tmp_path: Path, fake_gpu_index):
+    dataset, mapping = _stable_dataset(tmp_path)
+    fake_gpu_index.mapping = mapping
+    streamer = GpuLanceUniquePayloadStreamer(
+        _config(dataset, fetch_batch_size=1, max_pending_fetch_batches=1)
+    )
+    original_read = streamer._read_payload_operation
+    oversized_payload = b"x" * (128 * 1024)
+
+    def oversized_read(operation, projected):
+        result = original_read(operation, projected)
+        table = result.table.set_column(
+            result.table.schema.get_field_index("image"),
+            "image",
+            pa.array([oversized_payload], type=pa.large_binary()),
+        )
+        return gpu_mod._PayloadReadBatch(table=table, row_ids=result.row_ids)
+
+    streamer._read_payload_operation = oversized_read
+    outputs = list(streamer(pa.table({"source_ref": ["a"]})))
+
+    assert outputs[0].num_rows == 1
+    assert outputs[0].nbytes > len(oversized_payload)
+    metrics = get_gpu_fetch_metrics(outputs[0])
+    assert metrics["payload_batch_row_limit"] == 1
+    assert metrics["payload_byte_bound"] is False
+    streamer.close()
 
 
 def test_private_read_execution_timer_excludes_planning(
@@ -712,6 +876,48 @@ def test_ray_helper_converts_byte_target_to_coalesced_row_batch():
     assert calls["num_gpus"] == 1.0
     assert calls["memory"] == 4 * 1024**3
     assert calls["fn_constructor_args"] == (config,)
+
+
+def test_unique_stream_ray_helper_uses_iterator_row_count_semantics():
+    calls = {}
+
+    class FakeDataset:
+        def map_batches(self, fn, **kwargs):
+            calls["fn"] = fn
+            calls.update(kwargs)
+            return "streamed"
+
+    config = GpuLanceFetchConfig(
+        dataset_uri="memory://images",
+        dataset_version=1,
+        sidecar_files=("sidecar.parquet",),
+        sidecar_manifest_uri="sidecar-manifest.json",
+        sidecar_manifest_sha256="0" * 64,
+        columns={"image": "payload"},
+        expected_reference_rows=1,
+    )
+    result = stream_unique_lance_columns_on_gpu(
+        FakeDataset(),
+        config,
+        concurrency=3,
+        coalesce_target_bytes=1024,
+        estimated_row_bytes=10,
+        stable_row_id_output_column="image_row_id",
+        key_output_column="image_key",
+        memory=4 * 1024**3,
+    )
+
+    assert result == "streamed"
+    assert calls["fn"] is GpuLanceUniquePayloadStreamer
+    assert calls["batch_format"] == "pyarrow"
+    assert calls["batch_size"] == 102
+    assert calls["concurrency"] == 3
+    assert calls["udf_modifying_row_count"] is True
+    assert calls["fn_constructor_args"] == (
+        config,
+        "image_row_id",
+        "image_key",
+    )
 
 
 def test_config_repr_redacts_storage_options_without_changing_serialization():

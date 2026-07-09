@@ -18,8 +18,10 @@ from .fragment import LanceFragmentWriter
 from .gpu import (
     GpuLanceColumnFetcher,
     GpuLanceFetchConfig,
+    GpuLanceUniquePayloadStreamer,
     fetch_lance_columns_on_gpu,
     get_gpu_fetch_metrics,
+    stream_unique_lance_columns_on_gpu,
 )
 from .index import create_index, create_scalar_index, optimize_indices
 from .io import (
@@ -52,6 +54,8 @@ __all__ = [
     "LanceFragmentCommitter",
     "GpuLanceColumnFetcher",
     "GpuLanceFetchConfig",
+    "GpuLanceUniquePayloadStreamer",
     "fetch_lance_columns_on_gpu",
     "get_gpu_fetch_metrics",
+    "stream_unique_lance_columns_on_gpu",
 ]
